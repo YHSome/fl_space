@@ -1,0 +1,2 @@
+[console_scripts]
+fl-space = fl_space.cli:main

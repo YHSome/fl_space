@@ -1,0 +1,415 @@
+"""
+FedBuff 算法 — 异步联邦缓冲聚合 (Federated Buffered)
+
+论文: "FedBuff: Federated Learning with Buffered Asynchronous Aggregation"
+      (Nguyen et al., AISTATS 2022)
+
+与 FedAvg 的关键差异：
+    - 异步聚合：服务端不需要等待所有选中客户端，
+      而是维护一个大小为 K 的缓冲区。
+    - 当缓冲区收集满 K 个更新后，立即用这 K 个更新
+      执行一次聚合（先进先出 FIFO）。
+    - 客户端可以随时提交更新，不受轮次同步约束。
+    - 更适合太空场景：卫星通信窗口不可预测，
+      无法保证同步等待所有客户端。
+
+组件设计：
+    客户端选择器 → AsyncSelector（所有已连接客户端都可参与）
+    本地训练器   → AsyncTrainer（客户端异步训练后提交更新）
+    聚合器       → BufferAggregator（FIFO 缓冲区聚合）
+    评估器       → StandardEvaluator（与 FedAvg 相同）
+"""
+
+from __future__ import annotations
+
+import copy
+import threading
+from collections import deque
+from typing import Any
+
+from fl_space.fl.core import (
+    Aggregator,
+    ClientSelector,
+    ClientState,
+    ClientUpdate,
+    Evaluator,
+    LocalTrainer,
+)
+from fl_space.fl.fedavg import StandardEvaluator
+
+# PyTorch 可选依赖
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+
+# ── 1. 异步客户端选择器 ──────────────────────────────────────
+
+
+class AsyncSelector(ClientSelector):
+    """
+    异步客户端选择器。
+
+    所有已连接且准备好更新的客户端都可以参与，
+    不需要等待固定轮次的同步。
+
+    与 FedAvg 的 RandomSelector 不同：
+    - RandomSelector 每轮随机选 C 比例
+    - AsyncSelector 让所有连接者自由提交
+
+    Parameters
+    ----------
+    min_clients : int
+        最少参与者（用于初始轮）。
+    """
+
+    def __init__(self, min_clients: int = 2):
+        self.min_clients = min_clients
+
+    def select(
+        self,
+        clients: list[ClientState],
+        round_num: int,
+        **kwargs: Any,
+    ) -> list[int]:
+        """
+        选择所有可连接的客户端。
+
+        在异步模式下，所有连接的客户端都可以参与训练，
+        无需同步等待。
+
+        Parameters
+        ----------
+        clients : list[ClientState]
+            所有客户端状态。
+        round_num : int
+            当前轮次（异步模式下为参考值）。
+        **kwargs
+            可包含 already_training: set[int]，排除已在训练中的客户端。
+
+        Returns
+        -------
+        list[int]
+            可参与训练的客户端 ID 列表。
+        """
+        already_training: set[int] = kwargs.get("already_training", set())
+        connected = [
+            c for c in clients
+            if c.is_connected and c.client_id not in already_training
+        ]
+        return [c.client_id for c in connected]
+
+
+# ── 2. 异步本地训练器 ────────────────────────────────────────
+
+
+class AsyncTrainer(LocalTrainer):
+    """
+    异步本地训练器。
+
+    与 FedAvg 的 FixedEpochTrainer 类似（固定 E 个 epoch 的 SGD），
+    但设计用于异步场景：客户端独立训练并随时提交更新。
+
+    Parameters
+    ----------
+    local_epochs : int
+        本地训练 epoch 数，默认 5。
+    batch_size : int
+        训练 batch size，默认 32。
+    learning_rate : float
+        学习率，默认 0.01。
+    device : str
+        计算设备。
+    """
+
+    def __init__(
+        self,
+        local_epochs: int = 5,
+        batch_size: int = 32,
+        learning_rate: float = 0.01,
+        device: str = "cpu",
+    ):
+        if not TORCH_AVAILABLE:
+            raise ImportError("FedBuff 需要 PyTorch，请运行: pip install torch")
+
+        self.local_epochs = local_epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.device = device
+
+    def train(
+        self,
+        client_id: int,
+        model: nn.Module,
+        train_loader: DataLoader,
+        global_weights: list[Any],
+        round_num: int,
+        **kwargs: Any,
+    ) -> ClientUpdate:
+        """
+        异步本地训练。
+
+        客户端下载当前全局模型（可能有一定 staleness），
+        在本地训练后提交更新。
+        """
+        local_model = copy.deepcopy(model)
+        local_model.to(self.device)
+        local_model.train()
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(
+            local_model.parameters(),
+            lr=self.learning_rate,
+        )
+
+        data_size = len(train_loader.dataset)  # type: ignore
+        total_loss = 0.0
+
+        for _epoch in range(self.local_epochs):
+            epoch_loss = 0.0
+            for data, target in train_loader:
+                data, target = data.to(self.device), target.to(self.device)
+                optimizer.zero_grad()
+                output = local_model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+            total_loss += epoch_loss
+
+        avg_loss = total_loss / max(self.local_epochs, 1)
+
+        local_weights = [
+            param.data.clone() for param in local_model.parameters()
+        ]
+
+        return ClientUpdate(
+            client_id=client_id,
+            weights=local_weights,
+            data_size=data_size,
+            train_loss=avg_loss,
+            round_num=round_num,
+        )
+
+
+# ── 3. 缓冲区聚合器 ───────────────────────────────────────────
+
+
+class BufferAggregator(Aggregator):
+    """
+    异步缓冲区聚合器 (FedBuff 核心)。
+
+    维护一个大小为 K 的 FIFO 缓冲区。
+    当缓冲区满时：
+        1. 取出最旧的 K 个更新
+        2. 加权平均聚合
+        3. 更新全局模型
+
+    这种方式不需要同步等待所有客户端，
+    天然适应卫星通信不可预测的特点。
+
+    Parameters
+    ----------
+    buffer_size : int
+        缓冲区大小 K。K 越大越接近同步聚合，
+        K 越小越异步但 staleness 越大。
+    staleness_weight : bool
+        是否对陈旧更新降权。True 时较旧的更新权重降低。
+    """
+
+    def __init__(
+        self,
+        buffer_size: int = 5,
+        staleness_weight: bool = False,
+    ):
+        self.buffer_size = buffer_size
+        self.staleness_weight = staleness_weight
+
+        # FIFO 缓冲区
+        self._buffer: deque[ClientUpdate] = deque(maxlen=buffer_size)
+
+        # 全局轮次计数器（用于 staleness 计算）
+        self._global_round: int = 0
+
+        # 线程安全锁
+        self._lock = threading.Lock()
+
+    def add_update(self, update: ClientUpdate) -> None:
+        """
+        向缓冲区添加一个客户端更新（线程安全）。
+
+        在异步场景中，训练任务可能在不同线程中完成，
+        此方法确保缓冲区操作的线程安全。
+
+        Parameters
+        ----------
+        update : ClientUpdate
+            客户端训练结果。
+        """
+        with self._lock:
+            self._buffer.append(update)
+
+    def should_aggregate(
+        self,
+        collected_updates: list[ClientUpdate],
+        round_num: int,
+        **kwargs: Any,
+    ) -> bool:
+        """
+        当缓冲区达到 buffer_size 时触发聚合。
+
+        注意：异步模式下 collected_updates 参数通常为空或忽略，
+        实际判断基于内部缓冲区大小。
+        """
+        with self._lock:
+            return len(self._buffer) >= self.buffer_size
+
+    def aggregate(
+        self,
+        global_weights: list[torch.Tensor],
+        updates: list[ClientUpdate],
+        round_num: int,
+        **kwargs: Any,
+    ) -> list[torch.Tensor]:
+        """
+        从缓冲区取出 K 个更新进行加权平均聚合。
+
+        Parameters
+        ----------
+        global_weights : list
+            当前全局模型参数。
+        updates : list[ClientUpdate]
+            忽略（使用内部缓冲区）。
+        round_num : int
+            全局轮次（用于 staleness 标记）。
+
+        Returns
+        -------
+        list
+            聚合后的全局模型参数。
+        """
+        with self._lock:
+            self._global_round += 1
+
+            if len(self._buffer) < self.buffer_size:
+                return global_weights
+
+            # 取出缓冲区中最旧的 K 个更新
+            batch_updates = [
+                self._buffer.popleft()
+                for _ in range(self.buffer_size)
+            ]
+
+        total_size = sum(u.data_size for u in batch_updates)
+        if total_size == 0:
+            return global_weights
+
+        aggregated = [
+            torch.zeros_like(w, dtype=torch.float32)
+            for w in global_weights
+        ]
+
+        for update in batch_updates:
+            staleness = self._global_round - update.round_num
+            base_weight = update.data_size / total_size
+
+            # 陈旧度降权: w = 1 / (1 + staleness)
+            if self.staleness_weight and staleness > 0:
+                weight_ratio = base_weight / (1 + staleness)
+            else:
+                weight_ratio = base_weight
+
+            for i, (agg_w, client_w) in enumerate(
+                zip(aggregated, update.weights)
+            ):
+                if isinstance(client_w, torch.Tensor):
+                    agg_w.add_(client_w.float() * weight_ratio)
+                else:
+                    agg_w.add_(
+                        torch.tensor(client_w, dtype=torch.float32) * weight_ratio
+                    )
+
+        return aggregated
+
+    def buffer_status(self) -> dict[str, Any]:
+        """
+        查询缓冲区状态。
+
+        Returns
+        -------
+        dict
+            包含 buffer_size, current_count, global_round 的字典。
+        """
+        with self._lock:
+            return {
+                "buffer_size": self.buffer_size,
+                "current_count": len(self._buffer),
+                "global_round": self._global_round,
+            }
+
+
+# ── 4. 便捷构建函数 ───────────────────────────────────────────
+
+
+def create_fedbuff_components(
+    min_clients: int = 2,
+    local_epochs: int = 5,
+    batch_size: int = 32,
+    learning_rate: float = 0.01,
+    buffer_size: int = 5,
+    staleness_weight: bool = False,
+    device: str = "cpu",
+) -> tuple[ClientSelector, LocalTrainer, Aggregator, Evaluator]:
+    """
+    一键创建 FedBuff 的四件套组件。
+
+    Parameters
+    ----------
+    min_clients : int
+        最少参与者。
+    local_epochs : int
+        本地训练 epoch 数。
+    batch_size : int
+        训练 batch size。
+    learning_rate : float
+        学习率。
+    buffer_size : int
+        聚合缓冲区大小 K。
+    staleness_weight : bool
+        是否对陈旧更新降权。
+    device : str
+        计算设备。
+
+    Returns
+    -------
+    tuple
+        (selector, trainer, aggregator, evaluator)
+
+    使用示例::
+
+        from fl_space.fl.fedbuff import create_fedbuff_components
+
+        selector, trainer, aggregator, evaluator = create_fedbuff_components(
+            buffer_size=5,
+            staleness_weight=True,
+            device="cuda",
+        )
+    """
+    selector = AsyncSelector(min_clients=min_clients)
+    trainer = AsyncTrainer(
+        local_epochs=local_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        device=device,
+    )
+    aggregator = BufferAggregator(
+        buffer_size=buffer_size,
+        staleness_weight=staleness_weight,
+    )
+    evaluator = StandardEvaluator(device=device)
+
+    return selector, trainer, aggregator, evaluator

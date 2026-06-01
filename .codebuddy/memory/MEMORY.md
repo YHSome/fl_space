@@ -9,7 +9,7 @@
 ## 开发计划 (7步)
 1. ✅ 环境模拟设置 — 已完成模块化重构 (Kepler + Skyfield双后端, ruff规范化)
 2. ✅ 卫星设置（多星簇、自定义注册、可视化）— 2026-05-29
-3. 太空联邦的算法选择
+3. ✅ 太空联邦的算法选择 — FedAvg/FedProx/FedBuff (2026-06-01)
 4. 数据集
 5. 地面基站设置
 6. 保存节点（checkpoint机制）
@@ -94,4 +94,33 @@
 - 包含11个章节：架构概述、命名、类型注解、文档字符串、导入、数据模式、错误处理、Ruff配置、测试、AI辅助开发准则、检查清单
 - 特别包含 AI 辅助开发准则（第10章），涵盖提示词模板、AI代码检查流程、严禁事项
 - 附录提供常见模式速查和常见错误示例
+
+## Step 3 完成内容 — FL算法模块 (2026-06-01)
+
+### 架构设计 — 四组件解耦
+每种FL算法分解为四个可独立替换的组件：
+1. **ClientSelector** — 每轮选哪些客户端参与（RandomSelector / AsyncSelector）
+2. **LocalTrainer** — 本地训练 epoch 次数 + 逻辑（FixedEpochTrainer / ProximalTrainer / AsyncTrainer）
+3. **Aggregator** — 何时聚合 + 如何聚合（SyncWeightedAggregator / BufferAggregator）
+4. **Evaluator** — 模型评估（StandardEvaluator）
+
+### 三种算法实现
+- **FedAvg**: RandomSelector + FixedEpochTrainer + SyncWeightedAggregator（同步加权平均）
+- **FedProx**: 复用 FedAvg 的 selector/aggregator/evaluator，仅替换 trainer（增加 proximal term μ·||w-w_global||²）
+- **FedBuff**: AsyncSelector + AsyncTrainer + BufferAggregator（FIFO缓冲区K，异步聚合，支持staleness降权）
+
+### 关键文件 (fl_space/fl/)
+- `core.py` — 四个ABC + 数据结构（ClientState/ClientUpdate/FLRoundResult）
+- `fedavg.py` / `fedprox.py` / `fedbuff.py` — 算法实现 + create_*_components() 工厂
+- `models.py` — MLP/SimpleCNN + get_model()/register_model() 注册机制
+- `scheduler.py` — 通信调度器（完全独立于FL算法，读取模拟器接触矩阵）
+- `server.py` — FLServer 编排器 + FLConfig（支持run_sync/run_async双模式）
+- `runner.py` — FLRunner（IID/non-IID Dirichlet数据分配 + 模型创建 + 训练执行）
+- `config.py` — 3算法×3规模×3数据集 = 6个组合预设
+
+### 遵循导师建议
+- 调度器与算法完全解耦：scheduler 仅处理"何时可通信"，FL算法不涉及通信判断
+- 四组件接口清晰：每个组件有明确的输入/输出定义
+- 细粒度模块：组件可独立测试、替换、复用
+- ruff check + ruff format 通过，Python 3.9+ 类型注解
 

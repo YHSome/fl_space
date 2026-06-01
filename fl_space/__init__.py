@@ -9,6 +9,8 @@ fl_space — 太空联邦学习 (Space Federated Learning) 研究框架
     orbit/        — 轨道力学层（轨道计算、可见性判断）
     simulator/    — 模拟器层（接触矩阵、主模拟器）
     config/       — 配置层（默认参数、配置加载）
+    fl/           — 联邦学习层（可插拔 FL 算法框架）
+    viz/          — 可视化层（matplotlib 地图/热力图）
 """
 
 __version__ = "0.1.0"

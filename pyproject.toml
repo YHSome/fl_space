@@ -104,6 +104,9 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 
+[project.scripts]
+fl-space = "fl_space.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["fl_space", "fl_space.*"]
 

@@ -89,11 +89,20 @@ class FLRoundResult:
         本轮平均训练损失（参与客户端均值）。
     eval_metrics : dict
         评估指标，如 {"accuracy": 0.85, "loss": 0.42}。
+    timeslot : int
+        本轮结束时对应的模拟时间槽编号。
+    timeslot_start : int
+        本轮开始时的模拟时间槽编号。
+    time_breakdown : dict | None
+        本轮时间分解（由 TimeModel 产生），None 表示未启用。
     """
     round_num: int
     num_clients: int
     train_loss: float
     eval_metrics: dict[str, float] = field(default_factory=dict)
+    timeslot: int = 0
+    timeslot_start: int = 0
+    time_breakdown: dict[str, Any] | None = None
 
 
 # ── 四个核心抽象接口 ──────────────────────────────────────────

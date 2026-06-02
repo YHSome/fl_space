@@ -29,6 +29,7 @@ from fl_space.fl.core import (
     LocalTrainer,
 )
 from fl_space.fl.scheduler import CommunicationScheduler
+from fl_space.fl.time_model import TimeBreakdown, TimeModel, SlotTimeModel
 
 # PyTorch 可选依赖
 try:
@@ -85,6 +86,9 @@ class FLConfig:
     staleness_weight: bool = False
     device: str = "cpu"
     seed: int | None = None
+    # 时间模型配置
+    time_model: str = "slot"
+    time_model_kwargs: dict = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, config: dict) -> "FLConfig":
@@ -212,6 +216,7 @@ class FLServer:
         aggregator: Aggregator,
         evaluator: Evaluator,
         scheduler: CommunicationScheduler | None = None,
+        time_model: TimeModel | None = None,
     ):
         if not TORCH_AVAILABLE:
             raise ImportError("FLServer 需要 PyTorch，请运行: pip install torch")
@@ -223,15 +228,63 @@ class FLServer:
         self.evaluator = evaluator
         self.scheduler = scheduler
 
+        # 时间模型：显式传入 > 配置构建
+        if time_model is not None:
+            self.time_model = time_model
+        else:
+            self.time_model = self._build_time_model()
+
         # 运行时状态
         self._global_model: Any = None
         self._clients: list[ClientState] = []
         self._history: list[FLRoundResult] = []
 
+    def _build_time_model(self) -> TimeModel:
+        """根据 FLConfig 构建时间模型实例。"""
+        kwargs = dict(self.config.time_model_kwargs)
+
+        # 自动继承 timeslot 时长
+        sim = self.scheduler._sim if self.scheduler is not None else None
+        if sim is not None and "timeslot_duration_min" not in kwargs:
+            kwargs["timeslot_duration_min"] = getattr(
+                sim, "timeslot_duration_min", 1.0
+            )
+
+        return TimeModel.create(self.config.time_model, **kwargs)
+
     @property
     def history(self) -> list[FLRoundResult]:
         """训练历史记录。"""
         return self._history
+
+    @staticmethod
+    def _get_client_data_sizes(
+        train_loaders: dict[int, Any],
+    ) -> dict[int, int]:
+        """
+        从 DataLoader 提取每个客户端的数据量。
+
+        Parameters
+        ----------
+        train_loaders : dict[int, DataLoader]
+            客户端 ID → DataLoader 映射。
+
+        Returns
+        -------
+        dict[int, int]
+            客户端 ID → 样本数映射。
+        """
+        sizes: dict[int, int] = {}
+        for cid, loader in train_loaders.items():
+            try:
+                ds = loader.dataset
+                if hasattr(ds, "__len__"):
+                    sizes[cid] = len(ds)
+                else:
+                    sizes[cid] = 100
+            except Exception:
+                sizes[cid] = 100
+        return sizes
 
     def _init_clients(self) -> None:
         """初始化客户端状态列表。"""
@@ -313,13 +366,12 @@ class FLServer:
         """
         运行同步 FL 训练（适用于 FedAvg / FedProx）。
 
-        流程：
-            每轮：
-                1. 更新通信状态
-                2. 选择客户端
-                3. 分发模型 → 客户端本地训练
-                4. 收集更新 → 聚合 → 更新全局模型
-                5. 评估
+        通信驱动轮次推进：
+            1. 找到当前时刻可通信的卫星 → 分发全局模型
+            2. 卫星本地训练（不占虚拟时间）
+            3. 等待各卫星下一次接触窗口 → 上传模型
+            4. 聚合 → 新全局模型诞生 → 本轮完成
+            5. 时间跳到聚合后下一次有卫星连接的时隙 → 下一轮
 
         Parameters
         ----------
@@ -341,38 +393,116 @@ class FLServer:
         self._init_clients()
         self._history = []
 
-        for rnd in range(self.config.num_rounds):
-            # 1. 更新通信状态
-            timeslot = rnd * self.config.timeslots_per_round
-            self._update_connectivity(timeslot)
+        # 获取模拟器引用（用于通信窗口查询）
+        sim = self.scheduler._sim if self.scheduler is not None else None
+        max_ts = sim.num_timeslots if sim else 999999
 
-            # 2. 客户端选择
-            selected_ids = self.selector.select(self._clients, rnd)
-            if len(selected_ids) < 1:
+        # 计算模型大小（字节），供时间模型使用
+        model_size_bytes = sum(
+            p.numel() * p.element_size()
+            for p in self._global_model.parameters()
+        )
+
+        # 预计算客户端数据量
+        client_data_sizes = self._get_client_data_sizes(train_loaders)
+
+        current_ts = 0  # 当前虚拟时间槽
+        completed_rounds = 0  # 已完成轮次计数
+
+        while completed_rounds < self.config.num_rounds:
+            # ── 时间分解记录 ──
+            breakdown = TimeBreakdown()
+
+            # ── 1. 找到下一个有卫星连接的时隙（分发窗口）──
+            start_ts = self._advance_to_next_contact(current_ts, max_ts)
+            if start_ts is None:
                 if verbose:
-                    print(f"  轮次 {rnd + 1}: 无可选客户端，跳过")
+                    print(f"  轮次 {completed_rounds + 1}: 无更多通信窗口，训练终止")
+                break
+
+            breakdown.wait_distribution = start_ts - current_ts
+            current_ts = start_ts
+
+            # ── 1b. 模型下载耗时 ──
+            download_slots = self.time_model.compute_download_slots(model_size_bytes)
+            breakdown.download = download_slots
+            current_ts += download_slots
+
+            # ── 2. 更新通信状态，选择客户端 ──
+            self._update_connectivity(current_ts)
+            selected_ids = self.selector.select(self._clients, completed_rounds)
+            if len(selected_ids) < 1:
+                # 无可选客户端，前进1个时隙重试
+                current_ts += 1
                 continue
 
-            # 3. 本地训练
+            # ── 3. 本地训练（时间模型决定耗时）──
+            train_start_ts = current_ts
             updates: list[ClientUpdate] = []
+            max_train_slots = 0
             for cid in selected_ids:
-                update = self._train_client(cid, train_loaders, rnd)
+                update = self._train_client(cid, train_loaders, completed_rounds)
                 if update is not None:
                     updates.append(update)
+                    # 计算该客户端训练耗时
+                    n_samples = client_data_sizes.get(cid, 100)
+                    train_slots = self.time_model.compute_train_slots(
+                        cid, n_samples, self.config.local_epochs,
+                    )
+                    breakdown.per_satellite[cid] = {"train": train_slots}
+                    max_train_slots = max(max_train_slots, train_slots)
 
             if not updates:
-                if verbose:
-                    print(f"  轮次 {rnd + 1}: 无成功更新，跳过")
+                current_ts += 1
                 continue
 
-            # 4. 聚合
+            breakdown.train = max_train_slots
+            current_ts = train_start_ts + max_train_slots
+
+            # ── 4. 等待各卫星返回（下一次接触窗口 + 上传时间）──
+            if sim is not None:
+                return_times = []
+                return_start_ts = current_ts
+                for cid in selected_ids:
+                    next_contact = sim.get_next_contact(cid, current_ts)
+                    if next_contact is not None:
+                        contact_ts = next_contact[0]
+                        # 上传时间叠加在接触窗口之后
+                        upload_slots = self.time_model.compute_upload_slots(
+                            model_size_bytes,
+                        )
+                        breakdown.per_satellite.setdefault(cid, {})
+                        breakdown.per_satellite[cid]["upload"] = upload_slots
+                        breakdown.per_satellite[cid]["wait_return"] = (
+                            contact_ts - current_ts
+                        )
+                        return_times.append(contact_ts + upload_slots)
+                if return_times:
+                    current_ts = max(return_times)
+                    breakdown.wait_return = current_ts - return_start_ts
+                # 如果无返回窗口，模型更新丢失，但仍聚合已返回的
+            else:
+                # 无模拟器：固定步进
+                current_ts += self.config.timeslots_per_round
+                breakdown.wait_return = self.config.timeslots_per_round
+
+            # 上传时间从 per_satellite 汇总
+            breakdown.upload = max(
+                (v.get("upload", 0) for v in breakdown.per_satellite.values()),
+                default=0,
+            )
+            # 去掉上传时间重复计算（wait_return 已包含 upload 叠加）
+            # 这里 wait_return 记录的是从 train_end 到 return_ts 的总等待时间
+            # upload 单独记录以便分解展示
+
+            # ── 5. 聚合 → 新全局模型诞生 ──
             global_weights = [
                 param.data.clone()
                 for param in self._global_model.parameters()
             ]
-            if self.aggregator.should_aggregate(updates, rnd):
+            if self.aggregator.should_aggregate(updates, completed_rounds):
                 new_weights = self.aggregator.aggregate(
-                    global_weights, updates, rnd,
+                    global_weights, updates, completed_rounds,
                 )
                 with torch.no_grad():
                     for param, new_w in zip(
@@ -383,32 +513,81 @@ class FLServer:
             # 标记客户端参与
             for cid in selected_ids:
                 client = self._clients[cid]
-                client.last_update_round = rnd
+                client.last_update_round = completed_rounds
 
-            # 5. 评估
+            # ── 6. 评估 ──
             eval_metrics = self.evaluator.evaluate(
-                self._global_model, test_loader, rnd,
+                self._global_model, test_loader, completed_rounds,
             )
+
+            # 计算时间分解总计
+            breakdown.total = current_ts - start_ts
 
             avg_loss = sum(u.train_loss for u in updates) / len(updates)
             result = FLRoundResult(
-                round_num=rnd,
+                round_num=completed_rounds,
                 num_clients=len(updates),
                 train_loss=round(avg_loss, 6),
                 eval_metrics=eval_metrics,
+                timeslot=current_ts,
+                timeslot_start=start_ts,
+                time_breakdown=breakdown.to_dict(),
             )
             self._history.append(result)
 
+            completed_rounds += 1
+
+            # 准备下一轮：从聚合时刻之后开始
+            current_ts += 1
+
             if verbose:
                 acc = eval_metrics.get("accuracy", 0)
+                conn_at_start = (
+                    len(self.scheduler.get_connected_sats(start_ts))
+                    if self.scheduler else len(selected_ids)
+                )
+                # 构建时间分解显示
+                tm_display = self.time_model.slots_to_display(
+                    breakdown.total,
+                    getattr(self.time_model, "timeslot_duration_min", 1.0),
+                )
+                parts = []
+                if breakdown.download > 0:
+                    parts.append(f"下载:{breakdown.download}")
+                if breakdown.train > 0:
+                    parts.append(f"训练:{breakdown.train}")
+                if breakdown.upload > 0:
+                    parts.append(f"上传:{breakdown.upload}")
+                time_info = " | ".join(parts) if parts else "瞬时"
                 print(
-                    f"  轮次 {rnd + 1:3d}/{self.config.num_rounds} | "
-                    f"客户端: {len(updates):2d} | "
-                    f"训练损失: {avg_loss:.4f} | "
-                    f"准确率: {acc:.4f}"
+                    f"  轮次 {completed_rounds:3d}/{self.config.num_rounds} | "
+                    f"TS={start_ts:4d}→{result.timeslot:4d} "
+                    f"({tm_display}) | "
+                    f"在线:{conn_at_start} | "
+                    f"选中:{len(updates):2d} | "
+                    f"耗时: {time_info} | "
+                    f"准确率:{acc:.4f}"
                 )
 
         return self._history
+
+    def _advance_to_next_contact(
+        self, from_ts: int, max_ts: int
+    ) -> int | None:
+        """
+        从 from_ts 开始找到下一个有任意卫星连接的时隙。
+
+        如果没有调度器，直接返回 from_ts（假设始终可通信）。
+        如果超过 max_ts 仍无连接，返回 None。
+        """
+        if self.scheduler is None:
+            return from_ts
+
+        for ts in range(from_ts, max_ts):
+            connected = self.scheduler.get_connected_sats(ts)
+            if connected:
+                return ts
+        return None
 
     # ── 异步训练模式 (FedBuff) ──────────────────────────────
 
@@ -513,6 +692,7 @@ class FLServer:
                     num_clients=status["current_count"],
                     train_loss=0.0,  # 异步模式下难以精确计算
                     eval_metrics=dict(last_eval_metrics),
+                    timeslot=ts,
                 )
                 self._history.append(result)
 
@@ -591,12 +771,17 @@ class FLServer:
         list[dict]
             每轮结果字典。
         """
-        return [
-            {
+        results = []
+        for r in self._history:
+            entry: dict[str, Any] = {
                 "round": r.round_num,
+                "timeslot": r.timeslot,
+                "timeslot_start": r.timeslot_start,
                 "num_clients": r.num_clients,
                 "train_loss": r.train_loss,
-                **r.eval_metrics,
             }
-            for r in self._history
-        ]
+            entry.update(r.eval_metrics)
+            if r.time_breakdown:
+                entry["time_breakdown"] = r.time_breakdown
+            results.append(entry)
+        return results

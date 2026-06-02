@@ -42,6 +42,9 @@ def generate_walker_phases(
 
     卫星在轨道面上均匀分布，轨道面间的相位差 = F·360°/T。
     """
+    if num_planes > num_satellites:
+        raise ValueError(f"num_planes({num_planes}) > num_satellites({num_satellites})")
+
     if body is None:
         body = CelestialBody.earth()
 

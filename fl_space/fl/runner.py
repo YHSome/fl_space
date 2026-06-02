@@ -477,6 +477,16 @@ class FLRunner:
             if history:
                 final_acc = history[-1].eval_metrics.get("accuracy", 0)
                 print(f"  最终准确率: {final_acc:.4f}")
+                first_ts = history[0].timeslot_start
+                last_ts = history[-1].timeslot
+                total_slots = last_ts - first_ts
+                # 使用 time_model 显示可读时间
+                tm = self._server.time_model
+                ts_dur = getattr(tm, "timeslot_duration_min", 1.0)
+                time_str = tm.slots_to_display(total_slots, ts_dur) if tm else f"{total_slots} slots"
+                print(f"  虚拟时间范围: TS{first_ts} → TS{last_ts} "
+                      f"({time_str}, {len(history)} 轮)")
+                print(f"  时间模型: {tm.name}")
 
         return history
 

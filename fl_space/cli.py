@@ -307,6 +307,16 @@ def _cmd_train(args: argparse.Namespace) -> int:
         if args.staleness:
             overrides["staleness_weight"] = True
 
+    # 时间模型参数
+    if args.time_model is not None:
+        overrides["time_model"] = args.time_model
+    if args.time_model_args is not None:
+        try:
+            overrides["time_model_kwargs"] = json.loads(args.time_model_args)
+        except json.JSONDecodeError as e:
+            print(f"错误: --time-model-args JSON 解析失败: {e}")
+            return 1
+
     # 如果有 --config，用自定义组件构建 Runner
     if args.config:
         from fl_space.fl.fedavg import create_fedavg_components
@@ -364,6 +374,9 @@ def _cmd_train(args: argparse.Namespace) -> int:
         print(f"  本地 epoch: {runner.config.local_epochs}")
         print(f"  学习率: {runner.config.learning_rate}")
         print(f"  batch size: {runner.config.batch_size}")
+        print(f"  时间模型: {runner.config.time_model}")
+        if runner.config.time_model_kwargs:
+            print(f"  时间模型参数: {runner.config.time_model_kwargs}")
     print(f"  设备: {device}")
     if algo == "fedprox":
         mu_val = runner.config.mu if hasattr(runner, "config") else args.mu
@@ -385,7 +398,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
     if args.output:
         output_data = {
             "config": {
-                "algorithm": args.algo,
+                "algorithm": algo,
                 "dataset": args.dataset,
                 "scale": args.scale,
                 "rounds": args.rounds,
@@ -686,6 +699,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="计算设备 (默认: cpu)")
     p_train.add_argument("--seed", type=int, default=None,
                          help="随机种子")
+    p_train.add_argument("--time-model", type=str, default=None, metavar="MODEL",
+                         help="虚拟时间模型: slot|physics|path/to/file.py:ClassName (默认: slot)")
+    p_train.add_argument("--time-model-args", type=str, default=None, metavar="JSON",
+                         help="时间模型参数 (JSON字符串), 如 '{\"slots_per_epoch\":2}'")
     p_train.add_argument("--non-iid", action="store_true",
                          help="使用 non-IID 数据分布 (默认 IID)")
     p_train.add_argument("--alpha", type=float, default=0.5,

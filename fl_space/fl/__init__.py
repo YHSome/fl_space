@@ -82,6 +82,18 @@ from fl_space.fl.scheduler import (
 from fl_space.fl.server import (
     FLServer as FLServer,
 )
+from fl_space.fl.time_model import (
+    PhysicsTimeModel as PhysicsTimeModel,
+)
+from fl_space.fl.time_model import (
+    SlotTimeModel as SlotTimeModel,
+)
+from fl_space.fl.time_model import (
+    TimeBreakdown as TimeBreakdown,
+)
+from fl_space.fl.time_model import (
+    TimeModel as TimeModel,
+)
 
 __all__ = [
     # 核心抽象
@@ -97,6 +109,11 @@ __all__ = [
     "FLRunner",
     # 调度器
     "CommunicationScheduler",
+    # 时间模型
+    "TimeModel",
+    "TimeBreakdown",
+    "SlotTimeModel",
+    "PhysicsTimeModel",
     # 配置
     "FLConfig",
     "DATASET_PRESETS",

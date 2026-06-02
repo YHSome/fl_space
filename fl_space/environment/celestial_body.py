@@ -293,4 +293,4 @@ class CelestialBody:
     @classmethod
     def from_dict(cls, d: dict) -> "CelestialBody":
         """从字典创建天体。"""
-        return cls(**d)
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

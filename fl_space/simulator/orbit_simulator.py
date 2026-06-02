@@ -517,7 +517,7 @@ class OrbitSimulator:
             f"  轨道高度:           {self.orbit_altitude_km} km",
             f"  轨道倾角:           {self.orbit_inclination_deg}°",
             f"  轨道周期:           {self.orbit_period_min:.1f} min",
-            f"  分布策略:           {self.constellation_config.distribution}",
+            f"  分布策略:           {self.constellation_config.distribution if self.constellation_config else '自定义轨道'}",
             "",
             f"  地面站数量:         {self.num_ground_stations}",
             f"  Timeslot粒度:       {self.timeslot_duration_min} min",

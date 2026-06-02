@@ -124,3 +124,24 @@
 - 细粒度模块：组件可独立测试、替换、复用
 - ruff check + ruff format 通过，Python 3.9+ 类型注解
 
+## 虚拟时间模型 (2026-06-02)
+
+### 新增文件
+- `fl_space/fl/time_model.py` — TimeModel(ABC) + SlotTimeModel + PhysicsTimeModel + TimeBreakdown
+
+### 三种模式
+1. **SlotTimeModel** (`--time-model slot`): timeslot级粗粒度，可配置 slots_per_epoch/slots_per_mb_down/up
+2. **PhysicsTimeModel** (`--time-model physics`): FLOPs/带宽驱动的秒级物理精度，硬件感知
+3. **自定义**: `--time-model path/to/file.py:ClassName` 动态导入
+
+### 改动文件
+- `core.py`: FLRoundResult 新增 timeslot_start 和 time_breakdown 字段
+- `server.py`: FLConfig 新增 time_model/time_model_kwargs；FLServer 集成 TimeModel；run_sync 生成 TimeBreakdown
+- `runner.py`: 传递 TimeModel，训练完成摘要显示时间模型信息
+- `cli.py`: train 子命令新增 --time-model 和 --time-model-args 参数
+- `__init__.py`: 导出 TimeModel/TimeBreakdown/SlotTimeModel/PhysicsTimeModel
+
+### 测试结果
+- 全部通过：slot(train=0) 22min / slot(train=3) 37min / slot(全成本) 46min / physics 1h13min
+- 每轮输出显示时间分解（下载/训练/上传耗时）
+

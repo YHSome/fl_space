@@ -358,6 +358,8 @@ class FLRunner:
                 class_indices = np.where(targets == c)[0]
                 np.random.shuffle(class_indices)
                 n_holders = len(class_to_clients[c])
+                if n_holders == 0:
+                    continue  # 该类别未被任何客户端持有，跳过
                 split_sz = len(class_indices) // n_holders
                 start = 0
                 for h_idx, cid in enumerate(class_to_clients[c]):

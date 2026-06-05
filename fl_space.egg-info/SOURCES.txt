@@ -61,6 +61,7 @@ fl_space/fl/models.py
 fl_space/fl/runner.py
 fl_space/fl/scheduler.py
 fl_space/fl/server.py
+fl_space/fl/time_model.py
 fl_space/orbit/__init__.py
 fl_space/orbit/kepler_orbit.py
 fl_space/orbit/satellite_config.py
@@ -71,6 +72,8 @@ fl_space/orbit/visibility.py
 fl_space/simulator/__init__.py
 fl_space/simulator/contact_matrix.py
 fl_space/simulator/orbit_simulator.py
+fl_space/utils/__init__.py
+fl_space/utils/viz.py
 fl_space/viz/__init__.py
 fl_space/viz/orbit_plot.py
 tests/test_quick.py

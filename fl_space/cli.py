@@ -42,6 +42,7 @@ def _check_torch() -> bool:
     """检查 PyTorch 是否可用。"""
     try:
         import torch  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -51,6 +52,7 @@ def _check_skyfield() -> bool:
     """检查 Skyfield 是否可用。"""
     try:
         import skyfield  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -219,9 +221,11 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         print("--- 通信记录摘要 ---")
         for sat_id in range(args.sats):
             record = sim.get_communication_record(sat_id)
-            windows = len(set(
-                e.get("timeslot", 0) for e in record if e.get("in_contact")
-            )) if record else 0
+            windows = (
+                len(set(e.get("timeslot", 0) for e in record if e.get("in_contact")))
+                if record
+                else 0
+            )
             print(f"  SAT-{sat_id}: {windows} 个接触时段")
 
     # 导出 JSON
@@ -239,8 +243,7 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
             "stats": sim.stats,
             "contact_rate": sim.stats.get("contact_rate", 0),
             "communication_records": {
-                sat_id: sim.get_communication_record(sat_id)
-                for sat_id in range(args.sats)
+                sat_id: sim.get_communication_record(sat_id) for sat_id in range(args.sats)
             },
         }
         with open(args.output, "w", encoding="utf-8") as f:
@@ -350,10 +353,14 @@ def _cmd_train(args: argparse.Namespace) -> int:
             device=base_config.device,
             seed=base_config.seed,
             **({"mu": base_config.mu} if algo == "fedprox" else {}),
-            **({
-                "buffer_size": base_config.buffer_size,
-                "staleness_weight": base_config.staleness_weight,
-            } if algo == "fedbuff" else {}),
+            **(
+                {
+                    "buffer_size": base_config.buffer_size,
+                    "staleness_weight": base_config.staleness_weight,
+                }
+                if algo == "fedbuff"
+                else {}
+            ),
         )
 
         runner = FLRunner(base_config, *components)
@@ -437,6 +444,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
     if resource == "presets":
         from fl_space.fl.config import EXPERIMENT_PRESETS
+
         print("=== FL 实验预设 ===\n")
         for p in EXPERIMENT_PRESETS:
             print(f"  {p['name']:30s} — {p['description']}")
@@ -444,6 +452,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     elif resource == "models":
         try:
             from fl_space.fl.models import list_models
+
             print("=== 可用模型 ===\n")
             models = list_models()
             if models:
@@ -456,6 +465,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
     elif resource == "satellites":
         from fl_space.orbit.satellite_registry import registry
+
         print("=== 已注册卫星类型 ===\n")
         types = registry.list_types()
         if types:
@@ -472,6 +482,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
     elif resource == "experiments":
         from fl_space.config.defaults import EXPERIMENT_CONFIGS
+
         print("=== 模拟实验预设 ===\n")
         for cfg in EXPERIMENT_CONFIGS:
             name, sats, gss, desc = cfg
@@ -553,8 +564,7 @@ def _cmd_export(args: argparse.Namespace) -> int:
         "contact_rate": sim.stats.get("contact_rate", 0),
         "stats": sim.stats,
         "communication_records": {
-            f"SAT-{sat_id}": sim.get_communication_record(sat_id)
-            for sat_id in range(args.sats)
+            f"SAT-{sat_id}": sim.get_communication_record(sat_id) for sat_id in range(args.sats)
         },
     }
 
@@ -574,56 +584,114 @@ def _cmd_export(args: argparse.Namespace) -> int:
 
 def _cmd_experiment(args: argparse.Namespace) -> int:
     """
-    运行 SpaceFL 完整太空实验。
+    运行 SpaceFL 完整太空实验（支持 FedAvg 标准化网格 或 FedProx 异构轨道）。
 
     用法: fls experiment [参数]
 
     示例:
-        fls experiment --sats 10 --gs 1 3 5 --rounds 300
-        fls experiment --device cuda --train-workers 4 --output my_results
+        fls experiment --algo fedavg --gs 3 5 7 10 --sats 3 5 7 10
+        fls experiment --algo fedavg --gs 5 --sats 7
+        fls experiment --algo fedprox --sats 10 --gs 1 3 5 --rounds 300
+        fls experiment --algo fedprox --device cuda --train-workers 4
     """
     if not _check_torch():
         print("错误: 实验需要 PyTorch。请运行: pip install fl-space[full]")
         return 1
 
-    # 导入实验模块
-    try:
-        from examples.run_spacefl_experiment import run_experiment_suite
-    except ImportError:
-        # 尝试从当前目录导入
-        import importlib.util
-        import os as _os
-        spec_path = _os.path.join(
-            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-            "examples", "run_spacefl_experiment.py",
-        )
-        if not _os.path.exists(spec_path):
-            print(f"错误: 找不到实验模块: {spec_path}")
-            return 1
-        spec = importlib.util.spec_from_file_location("spacefl_experiment", spec_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        run_experiment_suite = module.run_experiment_suite
+    algo = getattr(args, "algo", "fedavg")
 
-    # 处理 altitudes
+    if algo == "fedavg":
+        return _cmd_experiment_fedavg(args)
+    else:
+        return _cmd_experiment_fedprox(args)
+
+
+def _cmd_experiment_fedavg(args: argparse.Namespace) -> int:
+    """FedAvg 标准化网格实验（论文地面站 + 均高卫星）。"""
+    import importlib.util
+    import os as _os
+
+    spec_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "examples",
+        "standard_experiment.py",
+    )
+    if not _os.path.exists(spec_path):
+        print(f"错误: 找不到标准化实验模块: {spec_path}")
+        return 1
+    spec = importlib.util.spec_from_file_location("standard_experiment", spec_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    run_experiment_grid = module.run_experiment_grid
+
+    import time as _time
+
+    t_start = _time.time()
+    run_experiment_grid(
+        gs_counts=args.gs,
+        sat_counts=args.sats,
+        num_rounds=args.rounds,
+        local_epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        early_stop_acc=args.early_stop,
+        altitude_km=getattr(args, "altitude", 500.0),
+        inclination_deg=args.inclination,
+        dataset=args.dataset,
+        device=args.device,
+        sim_hours=args.sim_hours,
+        timeslot_duration_min=args.timeslot_min,
+        seed=args.seed,
+        num_train_workers=args.train_workers,
+        num_workers=args.data_workers,
+        output_dir=args.output,
+        verbose=not args.quiet,
+    )
+    total_elapsed = _time.time() - t_start
+    if not args.quiet:
+        print(f"\n总耗时: {total_elapsed:.1f}s ({total_elapsed / 60:.1f}min)")
+        print(f"输出目录: {_os.path.abspath(args.output)}")
+    return 0
+
+
+def _cmd_experiment_fedprox(args: argparse.Namespace) -> int:
+    """FedProx 异构轨道实验（原有逻辑）。"""
+    import importlib.util
+    import os as _os
+
+    spec_path = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+        "examples",
+        "run_spacefl_experiment.py",
+    )
+    if not _os.path.exists(spec_path):
+        print(f"错误: 找不到 FedProx 实验模块: {spec_path}")
+        return 1
+    spec = importlib.util.spec_from_file_location("spacefl_experiment", spec_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    run_experiment_suite = module.run_experiment_suite
+
+    # fedprox 路径下 --sats 是列表，取第一个值（通常只有1个值）
+    n_sats = args.sats[0] if isinstance(args.sats, list) else args.sats
+
     altitudes = args.altitudes
     if altitudes is None:
-        altitudes = [
-            350 + i * (800 - 350) / max(args.sats - 1, 1)
-            for i in range(args.sats)
-        ] if args.sats > 1 else [500.0]
+        altitudes = (
+            [350 + i * (800 - 350) / max(n_sats - 1, 1) for i in range(n_sats)]
+            if n_sats > 1
+            else [500.0]
+        )
 
     output_dir = args.output
-    import os as _os
     _os.makedirs(output_dir, exist_ok=True)
 
-    # 运行实验
     import time as _time
 
     t_start = _time.time()
     _report = run_experiment_suite(
-        gs_counts=args.gs,
-        num_satellites=args.sats,
+        gs_counts=list(args.gs),
+        num_satellites=n_sats,
         num_rounds=args.rounds,
         altitudes_km=altitudes,
         inclination_deg=args.inclination,
@@ -642,12 +710,10 @@ def _cmd_experiment(args: argparse.Namespace) -> int:
         output_dir=output_dir,
         verbose=not args.quiet,
     )
-
     total_elapsed = _time.time() - t_start
     if not args.quiet:
-        print(f"\n总耗时: {total_elapsed:.1f}s ({total_elapsed/60:.1f}min)")
+        print(f"\n总耗时: {total_elapsed:.1f}s ({total_elapsed / 60:.1f}min)")
         print(f"输出目录: {_os.path.abspath(output_dir)}")
-
     return 0
 
 
@@ -675,9 +741,11 @@ def _cmd_quick_test(args: argparse.Namespace) -> int:
     except ImportError:
         import importlib.util
         import os as _os
+
         spec_path = _os.path.join(
             _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-            "examples", "quick_test.py",
+            "examples",
+            "quick_test.py",
         )
         if not _os.path.exists(spec_path):
             print(f"错误: 找不到 quick_test.py: {spec_path}")
@@ -716,18 +784,21 @@ def _cmd_info(args: argparse.Namespace) -> int:
     print("  NumPy:    ", end="")
     try:
         import numpy
+
         print(f"{ok} {numpy.__version__}")
     except ImportError:
         print(f"{no} 未安装")
     print("  Matplotlib: ", end="")
     try:
         import matplotlib
+
         print(f"{ok} {matplotlib.__version__}")
     except ImportError:
         print(f"{no} 未安装")
     print("  CUDA:     ", end="")
     try:
         import torch
+
         cuda_ok = torch.cuda.is_available()
         print(f"{ok + ' ' + torch.version.cuda if cuda_ok else no + ' 不可用 (CPU only)'}")
     except ImportError:
@@ -768,146 +839,247 @@ def build_parser() -> argparse.ArgumentParser:
     # ── simulate ──────────────────────────────────────────
 
     p_sim = sub.add_parser("simulate", help="运行轨道接触模拟")
-    p_sim.add_argument("--config", "-c", type=str, default=None,
-                       help="JSON 配置文件路径（CLI 参数将覆盖 JSON 中字段）")
+    p_sim.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help="JSON 配置文件路径（CLI 参数将覆盖 JSON 中字段）",
+    )
     p_sim.add_argument("--sats", "-n", type=int, default=5, help="卫星数量 (默认: 5)")
     p_sim.add_argument("--stations", "-g", type=int, default=3, help="地面站数量 (默认: 3)")
     p_sim.add_argument("--hours", "-t", type=float, default=24, help="模拟时长/小时 (默认: 24)")
-    p_sim.add_argument("--backend", "-b", choices=["kepler", "skyfield"], default="kepler",
-                       help="后端引擎 (默认: kepler)")
-    p_sim.add_argument("--altitude", "-a", type=float, default=500.0,
-                       help="轨道高度 km (默认: 500)")
-    p_sim.add_argument("--inclination", "-i", type=float, default=90.0,
-                       help="轨道倾角 ° (默认: 90)")
-    p_sim.add_argument("--distribution", "-d", choices=["walker", "cluster", "uniform"],
-                       default="uniform", help="星座分布策略 (默认: uniform)")
-    p_sim.add_argument("--timeslot-duration", type=float, default=1.0,
-                       help="每时间槽分钟数 (默认: 1.0)")
-    p_sim.add_argument("--output", "-o", type=str, default=None,
-                       help="导出 JSON 文件路径")
-    p_sim.add_argument("--generate-config", type=str, default=None, metavar="FILE",
-                       help="生成模拟器配置模板 JSON 到指定文件")
-    p_sim.add_argument("--show-contacts", action="store_true",
-                       help="显示通信记录摘要")
-    p_sim.add_argument("--quiet", "-q", action="store_true",
-                       help="安静模式，减少输出")
+    p_sim.add_argument(
+        "--backend",
+        "-b",
+        choices=["kepler", "skyfield"],
+        default="kepler",
+        help="后端引擎 (默认: kepler)",
+    )
+    p_sim.add_argument(
+        "--altitude", "-a", type=float, default=500.0, help="轨道高度 km (默认: 500)"
+    )
+    p_sim.add_argument(
+        "--inclination", "-i", type=float, default=90.0, help="轨道倾角 ° (默认: 90)"
+    )
+    p_sim.add_argument(
+        "--distribution",
+        "-d",
+        choices=["walker", "cluster", "uniform"],
+        default="uniform",
+        help="星座分布策略 (默认: uniform)",
+    )
+    p_sim.add_argument(
+        "--timeslot-duration", type=float, default=1.0, help="每时间槽分钟数 (默认: 1.0)"
+    )
+    p_sim.add_argument("--output", "-o", type=str, default=None, help="导出 JSON 文件路径")
+    p_sim.add_argument(
+        "--generate-config",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="生成模拟器配置模板 JSON 到指定文件",
+    )
+    p_sim.add_argument("--show-contacts", action="store_true", help="显示通信记录摘要")
+    p_sim.add_argument("--quiet", "-q", action="store_true", help="安静模式，减少输出")
     p_sim.set_defaults(func=_cmd_simulate)
 
     # ── train ─────────────────────────────────────────────
 
     p_train = sub.add_parser("train", help="运行 FL 训练实验")
-    p_train.add_argument("--config", "-c", type=str, default=None,
-                         help="JSON 配置文件路径（CLI 参数将覆盖 JSON 中字段）")
-    p_train.add_argument("--algo", choices=["fedavg", "fedprox", "fedbuff"],
-                         default="fedavg", help="FL 算法 (默认: fedavg)")
-    p_train.add_argument("--dataset", "-d", choices=["mnist", "fashion_mnist", "cifar10"],
-                         default="mnist", help="数据集 (默认: mnist)")
-    p_train.add_argument("--scale", "-s", choices=["small", "medium", "large"],
-                         default="small", help="实验规模 (默认: small)")
-    p_train.add_argument("--rounds", "-r", type=int, default=None,
-                         help="全局训练轮次 (覆盖规模默认值)")
-    p_train.add_argument("--epochs", "-e", type=int, default=5,
-                         help="本地训练 epoch 数 (默认: 5)")
-    p_train.add_argument("--lr", type=float, default=0.01,
-                         help="学习率 (默认: 0.01)")
-    p_train.add_argument("--batch-size", type=int, default=32,
-                         help="batch size (默认: 32)")
-    p_train.add_argument("--mu", type=float, default=0.01,
-                         help="FedProx 近端项系数 μ (默认: 0.01)")
-    p_train.add_argument("--buffer-size", type=int, default=5,
-                         help="FedBuff 缓冲区大小 K (默认: 5)")
-    p_train.add_argument("--staleness", action="store_true",
-                         help="FedBuff 启用陈旧度降权")
-    p_train.add_argument("--device", choices=["cpu", "cuda"], default="cpu",
-                         help="计算设备 (默认: cpu)")
-    p_train.add_argument("--seed", type=int, default=None,
-                         help="随机种子")
-    p_train.add_argument("--time-model", type=str, default=None, metavar="MODEL",
-                         help="虚拟时间模型: slot|physics|path/to/file.py:ClassName (默认: slot)")
-    p_train.add_argument("--time-model-args", type=str, default=None, metavar="JSON",
-                         help="时间模型参数 (JSON字符串), 如 '{\"slots_per_epoch\":2}'")
-    p_train.add_argument("--non-iid", action="store_true",
-                         help="使用 non-IID 数据分布 (默认 IID)")
-    p_train.add_argument("--alpha", type=float, default=0.5,
-                         help="non-IID Dirichlet alpha (默认: 0.5)")
-    p_train.add_argument("--output", "-o", type=str, default=None,
-                         help="导出训练历史 JSON 文件路径")
-    p_train.add_argument("--generate-config", type=str, default=None, metavar="FILE",
-                         help="生成 FL 实验配置模板 JSON 到指定文件")
-    p_train.add_argument("--quiet", "-q", action="store_true",
-                         help="安静模式，减少输出")
+    p_train.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        default=None,
+        help="JSON 配置文件路径（CLI 参数将覆盖 JSON 中字段）",
+    )
+    p_train.add_argument(
+        "--algo",
+        choices=["fedavg", "fedprox", "fedbuff"],
+        default="fedavg",
+        help="FL 算法 (默认: fedavg)",
+    )
+    p_train.add_argument(
+        "--dataset",
+        "-d",
+        choices=["mnist", "fashion_mnist", "cifar10"],
+        default="mnist",
+        help="数据集 (默认: mnist)",
+    )
+    p_train.add_argument(
+        "--scale",
+        "-s",
+        choices=["small", "medium", "large"],
+        default="small",
+        help="实验规模 (默认: small)",
+    )
+    p_train.add_argument(
+        "--rounds", "-r", type=int, default=None, help="全局训练轮次 (覆盖规模默认值)"
+    )
+    p_train.add_argument("--epochs", "-e", type=int, default=5, help="本地训练 epoch 数 (默认: 5)")
+    p_train.add_argument("--lr", type=float, default=0.01, help="学习率 (默认: 0.01)")
+    p_train.add_argument("--batch-size", type=int, default=32, help="batch size (默认: 32)")
+    p_train.add_argument("--mu", type=float, default=0.01, help="FedProx 近端项系数 μ (默认: 0.01)")
+    p_train.add_argument(
+        "--buffer-size", type=int, default=5, help="FedBuff 缓冲区大小 K (默认: 5)"
+    )
+    p_train.add_argument("--staleness", action="store_true", help="FedBuff 启用陈旧度降权")
+    p_train.add_argument(
+        "--device", choices=["cpu", "cuda"], default="cpu", help="计算设备 (默认: cpu)"
+    )
+    p_train.add_argument("--seed", type=int, default=None, help="随机种子")
+    p_train.add_argument(
+        "--time-model",
+        type=str,
+        default=None,
+        metavar="MODEL",
+        help="虚拟时间模型: slot|physics|path/to/file.py:ClassName (默认: slot)",
+    )
+    p_train.add_argument(
+        "--time-model-args",
+        type=str,
+        default=None,
+        metavar="JSON",
+        help="时间模型参数 (JSON字符串), 如 '{\"slots_per_epoch\":2}'",
+    )
+    p_train.add_argument("--non-iid", action="store_true", help="使用 non-IID 数据分布 (默认 IID)")
+    p_train.add_argument(
+        "--alpha", type=float, default=0.5, help="non-IID Dirichlet alpha (默认: 0.5)"
+    )
+    p_train.add_argument(
+        "--output", "-o", type=str, default=None, help="导出训练历史 JSON 文件路径"
+    )
+    p_train.add_argument(
+        "--generate-config",
+        type=str,
+        default=None,
+        metavar="FILE",
+        help="生成 FL 实验配置模板 JSON 到指定文件",
+    )
+    p_train.add_argument("--quiet", "-q", action="store_true", help="安静模式，减少输出")
     p_train.set_defaults(func=_cmd_train)
 
     # ── list ──────────────────────────────────────────────
 
     p_list = sub.add_parser("list", help="列出可用资源")
-    p_list.add_argument("resource", nargs="?", default="presets",
-                        choices=["presets", "models", "satellites", "experiments"],
-                        help="资源类型: presets|models|satellites|experiments")
+    p_list.add_argument(
+        "resource",
+        nargs="?",
+        default="presets",
+        choices=["presets", "models", "satellites", "experiments"],
+        help="资源类型: presets|models|satellites|experiments",
+    )
     p_list.set_defaults(func=_cmd_list)
 
     # ── export ────────────────────────────────────────────
 
     p_export = sub.add_parser("export", help="导出模拟结果为 JSON")
-    p_export.add_argument("--output", "-o", type=str, required=True,
-                          help="输出 JSON 文件路径")
-    p_export.add_argument("--body", choices=["earth", "mars", "moon", "jupiter", "saturn", "venus"],
-                          default="earth", help="中心天体 (默认: earth)")
+    p_export.add_argument("--output", "-o", type=str, required=True, help="输出 JSON 文件路径")
+    p_export.add_argument(
+        "--body",
+        choices=["earth", "mars", "moon", "jupiter", "saturn", "venus"],
+        default="earth",
+        help="中心天体 (默认: earth)",
+    )
     p_export.add_argument("--sats", "-n", type=int, default=10, help="卫星数量 (默认: 10)")
     p_export.add_argument("--stations", "-g", type=int, default=5, help="地面站数量 (默认: 5)")
     p_export.add_argument("--hours", "-t", type=float, default=24, help="模拟时长/小时 (默认: 24)")
-    p_export.add_argument("--altitude", "-a", type=float, default=500.0,
-                           help="轨道高度 km (默认: 500)")
-    p_export.add_argument("--inclination", "-i", type=float, default=90.0,
-                           help="轨道倾角 ° (默认: 90)")
-    p_export.add_argument("--backend", "-b", choices=["kepler", "skyfield"], default="kepler",
-                           help="后端引擎 (默认: kepler)")
-    p_export.add_argument("--timeslot", type=float, default=1.0,
-                           help="每时间槽分钟数 (默认: 1.0)")
+    p_export.add_argument(
+        "--altitude", "-a", type=float, default=500.0, help="轨道高度 km (默认: 500)"
+    )
+    p_export.add_argument(
+        "--inclination", "-i", type=float, default=90.0, help="轨道倾角 ° (默认: 90)"
+    )
+    p_export.add_argument(
+        "--backend",
+        "-b",
+        choices=["kepler", "skyfield"],
+        default="kepler",
+        help="后端引擎 (默认: kepler)",
+    )
+    p_export.add_argument("--timeslot", type=float, default=1.0, help="每时间槽分钟数 (默认: 1.0)")
     p_export.set_defaults(func=_cmd_export)
 
     # ── experiment ─────────────────────────────────────────
 
     p_exp = sub.add_parser(
         "experiment",
-        help="运行 SpaceFL 完整太空实验（异构轨道 + 多GS对比 + 基线FL）",
+        help="运行 SpaceFL 完整太空实验（FedAvg 标准化网格 / FedProx 异构轨道）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  fls experiment --sats 10 --gs 1 3 5 --rounds 300
-  fls experiment --sats 10 --gs 1 3 5 --device cuda --train-workers 4
+  fls experiment --algo fedavg --gs 3 5 7 10 --sats 3 5 7 10    # FedAvg 网格搜索
+  fls experiment --algo fedavg --gs 5 --sats 7                    # 单组 FedAvg
+  fls experiment --algo fedprox --sats 10 --gs 1 3 5 --rounds 300 # FedProx 异构轨道
+  fls experiment --algo fedprox --device cuda --train-workers 4
   fls experiment --dataset cifar10 --sim-hours 336 --output my_results
         """,
     )
-    p_exp.add_argument("--sats", type=int, default=10, help="卫星数量 (默认: 10)")
-    p_exp.add_argument("--gs", type=int, nargs="+", default=[1, 3, 5],
-                       help="地面站数量列表 (默认: 1 3 5)")
+    p_exp.add_argument(
+        "--algo",
+        choices=["fedavg", "fedprox"],
+        default="fedavg",
+        help="FL 算法 (默认: fedavg; fedprox 使用异构轨道)",
+    )
+    p_exp.add_argument(
+        "--sats",
+        type=int,
+        nargs="+",
+        default=[3, 5, 7, 10],
+        help="卫星数量列表 (fedavg 默认: 3 5 7 10; fedprox 默认: 10)",
+    )
+    p_exp.add_argument(
+        "--gs",
+        type=int,
+        nargs="+",
+        default=[3, 5, 7, 10],
+        help="地面站数量列表 (fedavg 默认: 3 5 7 10; fedprox 默认: 1 3 5)",
+    )
     p_exp.add_argument("--rounds", type=int, default=300, help="最大训练轮次 (默认: 300)")
-    p_exp.add_argument("--epochs", type=int, default=3, help="本地训练 epoch (默认: 3)")
+    p_exp.add_argument("--epochs", type=int, default=2, help="本地训练 epoch (默认: 2)")
     p_exp.add_argument("--batch-size", type=int, default=32, help="batch size (默认: 32)")
     p_exp.add_argument("--lr", type=float, default=0.01, help="学习率 (默认: 0.01)")
-    p_exp.add_argument("--mu", type=float, default=0.01, help="FedProx mu (默认: 0.01)")
-    p_exp.add_argument("--dataset", choices=["mnist", "fashion_mnist", "cifar10"],
-                       default="mnist", help="数据集 (默认: mnist)")
-    p_exp.add_argument("--device", choices=["cpu", "cuda"], default="cpu",
-                       help="计算设备 (默认: cpu)")
-    p_exp.add_argument("--early-stop", type=float, default=0.90,
-                       help="早停准确率阈值 (默认: 0.90)")
-    p_exp.add_argument("--train-workers", type=int, default=1,
-                       help="并行训练线程数 (默认: 1)")
-    p_exp.add_argument("--data-workers", type=int, default=0,
-                       help="DataLoader 并行进程数 (默认: 0)")
-    p_exp.add_argument("--inclination", type=float, default=53.0,
-                       help="轨道倾角° (默认: 53)")
-    p_exp.add_argument("--sim-hours", type=float, default=168.0,
-                       help="模拟时长/小时 (默认: 168 = 7天)")
-    p_exp.add_argument("--timeslot-min", type=float, default=1.0,
-                       help="每 timeslot 分钟数 (默认: 1.0)")
+    p_exp.add_argument("--mu", type=float, default=0.01, help="FedProx mu (仅 fedprox, 默认: 0.01)")
+    p_exp.add_argument(
+        "--dataset",
+        choices=["mnist", "fashion_mnist", "cifar10"],
+        default="mnist",
+        help="数据集 (默认: mnist)",
+    )
+    p_exp.add_argument(
+        "--device", choices=["cpu", "cuda"], default="cpu", help="计算设备 (默认: cpu)"
+    )
+    p_exp.add_argument("--early-stop", type=float, default=0.90, help="早停准确率阈值 (默认: 0.90)")
+    p_exp.add_argument("--train-workers", type=int, default=1, help="并行训练线程数 (默认: 1)")
+    p_exp.add_argument(
+        "--data-workers", type=int, default=0, help="DataLoader 并行进程数 (默认: 0)"
+    )
+    p_exp.add_argument("--inclination", type=float, default=53.0, help="轨道倾角° (默认: 53)")
+    p_exp.add_argument(
+        "--altitude", type=float, default=500.0, help="卫星轨道高度 km (fedavg 均高, 默认: 500)"
+    )
+    p_exp.add_argument(
+        "--sim-hours", type=float, default=168.0, help="模拟时长/小时 (默认: 168 = 7天)"
+    )
+    p_exp.add_argument(
+        "--timeslot-min", type=float, default=1.0, help="每 timeslot 分钟数 (默认: 1.0)"
+    )
     p_exp.add_argument("--seed", type=int, default=42, help="随机种子 (默认: 42)")
-    p_exp.add_argument("--output", "-o", type=str, default="experiment_output",
-                       help="输出目录 (默认: experiment_output)")
-    p_exp.add_argument("--altitudes", type=float, nargs="+", default=None,
-                       help="自定义卫星高度列表 km (默认: 350-800 均匀)")
+    p_exp.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        default="experiment_output",
+        help="输出目录 (默认: experiment_output)",
+    )
+    p_exp.add_argument(
+        "--altitudes",
+        type=float,
+        nargs="+",
+        default=None,
+        help="自定义卫星高度列表 km (fedprox 异构轨道)",
+    )
     p_exp.add_argument("--quiet", "-q", action="store_true", help="安静模式")
     p_exp.set_defaults(func=_cmd_experiment)
 
@@ -925,30 +1097,24 @@ def build_parser() -> argparse.ArgumentParser:
   fls quick-test --oscillation-threshold 0.08        # 调整灵敏度
         """,
     )
-    p_qt.add_argument("--output", "-o", default="results",
-                      help="输出目录 (默认: results)")
-    p_qt.add_argument("--mu", type=float, default=0.01,
-                      help="基础 μ / 固定 μ (默认: 0.01)")
-    p_qt.add_argument("--mu-min", type=float, default=0.001,
-                      help="自适应 μ 下限 (默认: 0.001)")
-    p_qt.add_argument("--mu-max", type=float, default=1.0,
-                      help="自适应 μ 上限 (默认: 1.0)")
-    p_qt.add_argument("--oscillation-threshold", type=float, default=0.1,
-                      help="震荡阈值，超过触发 μ↑ (默认: 0.1)")
-    p_qt.add_argument("--stability-threshold", type=float, default=0.03,
-                      help="稳定阈值，低于触发 μ↓ (默认: 0.03)")
-    p_qt.add_argument("--no-adaptive", action="store_true",
-                      help="禁用自适应 μ，使用固定 μ (传统 FedProx)")
-    p_qt.add_argument("--rounds", type=int, default=300,
-                      help="最大轮数 (默认: 300)")
-    p_qt.add_argument("--epochs", type=int, default=2,
-                      help="本地epoch (默认: 2)")
-    p_qt.add_argument("--early-stop", type=float, default=0.9,
-                      help="早停阈值 (默认: 0.9)")
-    p_qt.add_argument("--gs", type=int, default=5,
-                      help="地面站数 (默认: 5)")
-    p_qt.add_argument("--quiet", "-q", action="store_true",
-                      help="安静模式")
+    p_qt.add_argument("--output", "-o", default="results", help="输出目录 (默认: results)")
+    p_qt.add_argument("--mu", type=float, default=0.01, help="基础 μ / 固定 μ (默认: 0.01)")
+    p_qt.add_argument("--mu-min", type=float, default=0.001, help="自适应 μ 下限 (默认: 0.001)")
+    p_qt.add_argument("--mu-max", type=float, default=1.0, help="自适应 μ 上限 (默认: 1.0)")
+    p_qt.add_argument(
+        "--oscillation-threshold", type=float, default=0.1, help="震荡阈值，超过触发 μ↑ (默认: 0.1)"
+    )
+    p_qt.add_argument(
+        "--stability-threshold", type=float, default=0.03, help="稳定阈值，低于触发 μ↓ (默认: 0.03)"
+    )
+    p_qt.add_argument(
+        "--no-adaptive", action="store_true", help="禁用自适应 μ，使用固定 μ (传统 FedProx)"
+    )
+    p_qt.add_argument("--rounds", type=int, default=300, help="最大轮数 (默认: 300)")
+    p_qt.add_argument("--epochs", type=int, default=2, help="本地epoch (默认: 2)")
+    p_qt.add_argument("--early-stop", type=float, default=0.9, help="早停阈值 (默认: 0.9)")
+    p_qt.add_argument("--gs", type=int, default=5, help="地面站数 (默认: 5)")
+    p_qt.add_argument("--quiet", "-q", action="store_true", help="安静模式")
     p_qt.set_defaults(func=_cmd_quick_test)
 
     # ── info ──────────────────────────────────────────────
@@ -1064,6 +1230,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误: {e}")
         if "--quiet" not in argv:
             import traceback
+
             traceback.print_exc()
         return 1
 

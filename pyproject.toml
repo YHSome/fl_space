@@ -67,6 +67,7 @@ ignore = [
     "B028",   # 禁止无消息的 assert 语句（测试需要）
     "SIM108", # 用 ternary 代替 if-else（不强制）
     "PERF203", # try-except 在循环中（有时刻意设计）
+    "RUF001", # 中文全角标点（中文文档/CLI help 正常用法）
     "RUF002", # 中文文档中的全角标点（中文文档正常用法）
 ]
 
@@ -105,6 +106,7 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 
 [project.scripts]
+fls = "fl_space.cli:main"
 fl-space = "fl_space.cli:main"
 
 [tool.setuptools.packages.find]

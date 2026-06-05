@@ -206,6 +206,7 @@ class OrbitSimulator:
         # ---- 时间参数 ----
         self.timeslot_duration_min = timeslot_duration_min
         self.num_timeslots = num_timeslots
+        self.num_timeslots_pre = num_timeslots  # 记录初始预计算大小
 
         # 轨道周期 (取第一颗卫星，因为都使用相同高度)
         self.orbit_period_min = self.orbits[0].period_min if self.orbits else 0.0
@@ -221,6 +222,9 @@ class OrbitSimulator:
         self.contact_matrix = ContactMatrix(
             self.num_satellites, self.num_timeslots, mode=contact_mode
         )
+
+        # ---- 保存可见性引擎引用（用于按需扩展）----
+        self._multi_vis = None  # 延迟初始化（避免不必要的创建）
 
         # ---- 生成接触数据 ----
         t0 = _time.time()
@@ -282,7 +286,7 @@ class OrbitSimulator:
 
     def _generate_contacts_kepler(self):
         """Kepler 后端接触矩阵生成。"""
-        multi_vis = MultiSatVisibility(self.body, self.orbits, self.ground_network)
+        multi_vis = self._get_multi_vis()
 
         for ts in range(self.num_timeslots):
             if self.verbose and self.num_timeslots > 5000 and ts % (self.num_timeslots // 10) == 0:
@@ -298,6 +302,71 @@ class OrbitSimulator:
         if self.verbose:
             print(f"    [OrbitSim:kepler] 接触矩阵生成完毕, "
                   f"接触率: {np.mean(np.sum(self.contact_matrix.simple_matrix >= 0, axis=1)) / self.num_timeslots * 100:.1f}%")
+
+    def _get_multi_vis(self):
+        """延迟初始化 MultiSatVisibility（Kepler 后端按需计算用）。"""
+        if self._multi_vis is None:
+            self._multi_vis = MultiSatVisibility(
+                self.body, self.orbits, self.ground_network,
+            )
+        return self._multi_vis
+
+    def _compute_contacts_for_slot(self, timeslot: int) -> list[list[int]]:
+        """
+        按需计算单个 timeslot 的接触数据并写入矩阵。
+
+        如果 timeslot 超出当前矩阵范围，自动扩展矩阵。
+
+        Returns
+        -------
+        list[list[int]]
+            每个卫星的可见地面站 ID 列表。
+        """
+        if timeslot >= self.num_timeslots:
+            # 扩展矩阵：至少扩到 timeslot+1，每次扩展量不少于一个轨道周期
+            min_extension = int(1.2 * self.orbit_period_min / self.timeslot_duration_min)
+            target = max(timeslot + 1, self.num_timeslots + min_extension)
+            self._extend_to(target)
+
+        time_min = timeslot * self.timeslot_duration_min
+        multi_vis = self._get_multi_vis()
+        all_visible = multi_vis.visible_matrix_at_time(time_min)
+
+        for sat_id, visible_gs in enumerate(all_visible):
+            self.contact_matrix.set_contacts(sat_id, timeslot, visible_gs)
+
+        return all_visible
+
+    def _extend_to(self, target_slots: int) -> None:
+        """
+        批量扩展接触矩阵至 target_slots，一次性计算新增时隙的接触数据。
+
+        Parameters
+        ----------
+        target_slots : int
+            目标时隙总数。
+        """
+        if target_slots <= self.num_timeslots:
+            return
+
+        old_slots = self.num_timeslots
+        new_slots = self.contact_matrix.extend(target_slots)
+        added = new_slots - old_slots
+
+        multi_vis = self._get_multi_vis()
+
+        for ts in range(old_slots, new_slots):
+            time_min = ts * self.timeslot_duration_min
+            all_visible = multi_vis.visible_matrix_at_time(time_min)
+            for sat_id, visible_gs in enumerate(all_visible):
+                self.contact_matrix.set_contacts(sat_id, ts, visible_gs)
+
+        self.num_timeslots = new_slots
+
+        if self.verbose and added > 100:
+            print(f"    [OrbitSim] 按需扩展 {added} 时隙 "
+                  f"({added * self.timeslot_duration_min / 60:.1f}h), "
+                  f"总计 {new_slots} 时隙")
 
     def _generate_contacts_skyfield(self):
         """Skyfield 后端接触矩阵生成（使用精确仰角判断）。"""
@@ -348,17 +417,56 @@ class OrbitSimulator:
         return self.contact_matrix.get_first_contact(sat_id, timeslot)
 
     def get_all_contacts(self, sat_id: int, timeslot: int) -> list[int]:
-        """获取所有可见地面站 ID 列表。"""
+        """获取所有可见地面站 ID 列表（自动扩展矩阵）。"""
+        if timeslot >= self.num_timeslots:
+            all_visible = self._compute_contacts_for_slot(timeslot)
+            return all_visible[sat_id] if sat_id < len(all_visible) else []
         return self.contact_matrix.get_all_contacts(sat_id, timeslot)
 
     def get_next_contact(
         self, sat_id: int, after_timeslot: int
     ) -> Optional[tuple[int, int]]:
-        """获取下一次接触窗口。"""
-        return self.contact_matrix.get_next_contact(sat_id, after_timeslot)
+        """
+        获取某卫星在指定 timeslot 之后的下一次接触。
+
+        自动扩展矩阵：如果预计算范围内无接触，继续向前搜索。
+
+        Returns
+        -------
+        Optional[tuple[int, int]]
+            (timeslot, gs_id) 或 None。
+        """
+        # 先在预计算范围内查找
+        result = self.contact_matrix.get_next_contact(sat_id, after_timeslot)
+        if result is not None:
+            return result
+
+        # 按需搜索：每次扩展一个轨道周期的时隙，直到找到接触
+        search_chunk = int(1.2 * self.orbit_period_min / self.timeslot_duration_min)
+        search_chunk = max(search_chunk, 100)  # 至少100个时隙
+
+        search_start = max(after_timeslot + 1, self.num_timeslots)
+        search_end = search_start + search_chunk
+
+        while True:
+            self._extend_to(search_end)
+            # 在新扩展的范围内查找
+            for ts in range(search_start, search_end):
+                gs_id = self.contact_matrix.get_first_contact(sat_id, ts)
+                if gs_id >= 0:
+                    return (ts, int(gs_id))
+            # 未找到，继续扩展
+            search_start = search_end
+            search_end += search_chunk
+            # 安全阀：最多搜索 100 个轨道周期（几十年模拟时间）
+            if search_end > self.num_timeslots + search_chunk * 100:
+                return None
 
     def get_satellites_in_contact(self, timeslot: int) -> list[int]:
-        """获取某时刻可通信的所有卫星。"""
+        """获取某时刻可通信的所有卫星（自动扩展矩阵）。"""
+        if timeslot >= self.num_timeslots:
+            all_visible = self._compute_contacts_for_slot(timeslot)
+            return [sat_id for sat_id, visible in enumerate(all_visible) if visible]
         return self.contact_matrix.get_satellites_in_contact(timeslot)
 
     def get_contact_detail(self, sat_id: int, timeslot: int) -> dict:

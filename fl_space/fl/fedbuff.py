@@ -22,9 +22,9 @@ FedBuff 算法 — 异步联邦缓冲聚合 (Federated Buffered)
 
 from __future__ import annotations
 
+from collections import deque
 import copy
 import threading
-from collections import deque
 from typing import Any
 
 from fl_space.fl.core import (

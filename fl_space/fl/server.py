@@ -29,7 +29,7 @@ from fl_space.fl.core import (
     LocalTrainer,
 )
 from fl_space.fl.scheduler import CommunicationScheduler
-from fl_space.fl.time_model import TimeBreakdown, TimeModel, SlotTimeModel
+from fl_space.fl.time_model import TimeBreakdown, TimeModel
 
 # PyTorch 可选依赖
 try:
@@ -89,9 +89,14 @@ class FLConfig:
     # 时间模型配置
     time_model: str = "slot"
     time_model_kwargs: dict = field(default_factory=dict)
+    # 性能优化
+    num_workers: int = 0       # DataLoader 并行进程数
+    num_train_workers: int = 1 # 客户端并行训练线程数（1=串行）
+    # 早停
+    early_stop_acc: float | None = None  # 准确率阈值，达到后自动停止（如 0.9）
 
     @classmethod
-    def from_dict(cls, config: dict) -> "FLConfig":
+    def from_dict(cls, config: dict) -> FLConfig:
         """
         从字典创建 FLConfig。
 
@@ -121,7 +126,7 @@ class FLConfig:
         return cls(**filtered)
 
     @classmethod
-    def from_json(cls, filepath: str) -> "FLConfig":
+    def from_json(cls, filepath: str) -> FLConfig:
         """
         从 JSON 文件加载 FLConfig。
 
@@ -140,7 +145,7 @@ class FLConfig:
             config = FLConfig.from_json("my_experiment.json")
         """
         import json
-        with open(filepath, "r", encoding="utf-8") as f:
+        with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
         return cls.from_dict(data)
 
@@ -317,6 +322,7 @@ class FLServer:
         client_id: int,
         train_loaders: dict[int, Any],
         round_num: int,
+        global_weights: list[Any] | None = None,
     ) -> ClientUpdate | None:
         """
         训练单个客户端。
@@ -329,6 +335,8 @@ class FLServer:
             客户端 ID → DataLoader 映射。
         round_num : int
             当前全局轮次。
+        global_weights : list | None
+            预克隆的全局权重，避免每客户端重复克隆。
 
         Returns
         -------
@@ -339,10 +347,11 @@ class FLServer:
             return None
 
         try:
-            global_weights = [
-                param.data.clone()
-                for param in self._global_model.parameters()
-            ]
+            if global_weights is None:
+                global_weights = [
+                    param.data.clone()
+                    for param in self._global_model.parameters()
+                ]
             return self.trainer.train(
                 client_id=client_id,
                 model=self._global_model,
@@ -353,6 +362,96 @@ class FLServer:
         except Exception as e:
             print(f"  [警告] 客户端 {client_id} 训练失败: {e}")
             return None
+
+    def _train_clients_parallel(
+        self,
+        selected_ids: list[int],
+        train_loaders: dict[int, Any],
+        round_num: int,
+    ) -> list[ClientUpdate]:
+        """
+        并行训练多个客户端。
+
+        使用线程池并行执行多个客户端的本地训练。
+        trainer.train() 内部会 deepcopy 模型，因此多个线程
+        同时读取 self._global_model 是安全的。
+
+        性能收益：
+            - GPU 训练：CUDA 操作释放 GIL，多线程可重叠 GPU 计算
+            - CPU 训练：重叠数据加载和计算
+
+        Parameters
+        ----------
+        selected_ids : list[int]
+            选中的客户端 ID 列表。
+        train_loaders : dict[int, DataLoader]
+            客户端 ID → DataLoader 映射。
+        round_num : int
+            当前全局轮次。
+
+        Returns
+        -------
+        list[ClientUpdate]
+            成功训练的客户端更新列表。
+        """
+        import concurrent.futures
+
+        n_workers = getattr(self.config, 'num_train_workers', 1) or 1
+
+        if n_workers <= 1 or len(selected_ids) <= 1:
+            # 串行模式：预克隆一次全局权重，所有客户端复用
+            global_weights = [
+                param.data.clone()
+                for param in self._global_model.parameters()
+            ]
+            updates = []
+            for i, cid in enumerate(selected_ids):
+                print(".", end="", flush=True)
+                update = self._train_client(
+                    cid, train_loaders, round_num, global_weights=global_weights,
+                )
+                if update is not None:
+                    updates.append(update)
+            return updates
+
+        # 并行模式：预克隆全局权重（只读，线程安全）
+        global_weights = [
+            param.data.clone()
+            for param in self._global_model.parameters()
+        ]
+
+        def _train_single(cid: int) -> ClientUpdate | None:
+            if cid not in train_loaders:
+                return None
+            try:
+                update = self.trainer.train(
+                    client_id=cid,
+                    model=self._global_model,
+                    train_loader=train_loaders[cid],
+                    global_weights=global_weights,
+                    round_num=round_num,
+                )
+                return update
+            except Exception as e:
+                print(f"  [警告] 客户端 {cid} 训练失败: {e}")
+                return None
+
+        max_workers = min(n_workers, len(selected_ids))
+        updates: list[ClientUpdate] = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+        ) as executor:
+            future_map = {
+                executor.submit(_train_single, cid): cid
+                for cid in selected_ids
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                result = future.result()
+                if result is not None:
+                    updates.append(result)
+
+        return updates
 
     # ── 同步训练模式 (FedAvg / FedProx) ──────────────────────
 
@@ -395,7 +494,6 @@ class FLServer:
 
         # 获取模拟器引用（用于通信窗口查询）
         sim = self.scheduler._sim if self.scheduler is not None else None
-        max_ts = sim.num_timeslots if sim else 999999
 
         # 计算模型大小（字节），供时间模型使用
         model_size_bytes = sum(
@@ -414,7 +512,7 @@ class FLServer:
             breakdown = TimeBreakdown()
 
             # ── 1. 找到下一个有卫星连接的时隙（分发窗口）──
-            start_ts = self._advance_to_next_contact(current_ts, max_ts)
+            start_ts = self._advance_to_next_contact(current_ts)
             if start_ts is None:
                 if verbose:
                     print(f"  轮次 {completed_rounds + 1}: 无更多通信窗口，训练终止")
@@ -436,21 +534,23 @@ class FLServer:
                 current_ts += 1
                 continue
 
-            # ── 3. 本地训练（时间模型决定耗时）──
+            # ── 3. 本地训练（并行 + 时间模型决定耗时）──
+            if verbose:
+                print(f"  轮次 {completed_rounds + 1:3d}/{self.config.num_rounds} | "
+                      f"训练 {len(selected_ids)} 客户端...", end="", flush=True)
             train_start_ts = current_ts
-            updates: list[ClientUpdate] = []
+            updates = self._train_clients_parallel(
+                selected_ids, train_loaders, completed_rounds,
+            )
             max_train_slots = 0
-            for cid in selected_ids:
-                update = self._train_client(cid, train_loaders, completed_rounds)
-                if update is not None:
-                    updates.append(update)
-                    # 计算该客户端训练耗时
-                    n_samples = client_data_sizes.get(cid, 100)
-                    train_slots = self.time_model.compute_train_slots(
-                        cid, n_samples, self.config.local_epochs,
-                    )
-                    breakdown.per_satellite[cid] = {"train": train_slots}
-                    max_train_slots = max(max_train_slots, train_slots)
+            for update in updates:
+                cid = update.client_id
+                n_samples = client_data_sizes.get(cid, 100)
+                train_slots = self.time_model.compute_train_slots(
+                    cid, n_samples, self.config.local_epochs,
+                )
+                breakdown.per_satellite[cid] = {"train": train_slots}
+                max_train_slots = max(max_train_slots, train_slots)
 
             if not updates:
                 current_ts += 1
@@ -520,6 +620,11 @@ class FLServer:
                 self._global_model, test_loader, completed_rounds,
             )
 
+            # ── 6b. 自适应 μ 反馈 (FedProxSat) ──
+            current_acc = eval_metrics.get("accuracy", 0)
+            if hasattr(self.trainer, 'update_accuracy'):
+                _ = self.trainer.update_accuracy(current_acc)
+
             # 计算时间分解总计
             breakdown.total = current_ts - start_ts
 
@@ -536,6 +641,14 @@ class FLServer:
             self._history.append(result)
 
             completed_rounds += 1
+
+            # ── 早停检查 ──
+            early_stop_acc = getattr(self.config, 'early_stop_acc', None)
+            if early_stop_acc is not None and current_acc >= early_stop_acc:
+                if verbose:
+                    print(f"\n  >>> 早停触发: 准确率 {current_acc:.4f} >= {early_stop_acc} "
+                          f"(第 {completed_rounds} 轮)")
+                break
 
             # 准备下一轮：从聚合时刻之后开始
             current_ts += 1
@@ -560,34 +673,53 @@ class FLServer:
                     parts.append(f"上传:{breakdown.upload}")
                 time_info = " | ".join(parts) if parts else "瞬时"
                 print(
-                    f"  轮次 {completed_rounds:3d}/{self.config.num_rounds} | "
+                    f"  \r  轮次 {completed_rounds:3d}/{self.config.num_rounds} | "
                     f"TS={start_ts:4d}→{result.timeslot:4d} "
                     f"({tm_display}) | "
                     f"在线:{conn_at_start} | "
                     f"选中:{len(updates):2d} | "
-                    f"耗时: {time_info} | "
+                    f"{time_info} | "
                     f"准确率:{acc:.4f}"
                 )
 
+        # ── 虚拟时间汇总 ──
+        if sim is not None and self._history:
+            final_ts = self._history[-1].timeslot
+            total_hours = final_ts * sim.timeslot_duration_min / 60.0
+            if verbose:
+                print(f"\n  [模拟时间] 总虚拟时间: {final_ts} timeslots = "
+                      f"{total_hours:.1f} 小时 ({total_hours/24:.1f} 天), "
+                      f"预计算: {sim.num_timeslots_pre:.0f} slots")
+
         return self._history
 
-    def _advance_to_next_contact(
-        self, from_ts: int, max_ts: int
-    ) -> int | None:
+    def _advance_to_next_contact(self, from_ts: int) -> int | None:
         """
         从 from_ts 开始找到下一个有任意卫星连接的时隙。
 
+        使用 OrbitSimulator 的按需扩展能力，不再受预计算范围限制。
         如果没有调度器，直接返回 from_ts（假设始终可通信）。
-        如果超过 max_ts 仍无连接，返回 None。
+
+        Returns
+        -------
+        int | None
+            下一个可通信时隙，或 None（所有卫星永久无连接）。
         """
         if self.scheduler is None:
             return from_ts
 
-        for ts in range(from_ts, max_ts):
-            connected = self.scheduler.get_connected_sats(ts)
-            if connected:
-                return ts
-        return None
+        sim = self.scheduler._sim
+
+        # 用 get_next_contact 为每颗卫星高效查找（支持按需扩展）
+        earliest = None
+        for sat_id in range(sim.num_satellites):
+            nc = sim.get_next_contact(sat_id, from_ts - 1)
+            if nc is not None:
+                ts, _ = nc
+                if earliest is None or ts < earliest:
+                    earliest = ts
+
+        return earliest
 
     # ── 异步训练模式 (FedBuff) ──────────────────────────────
 

@@ -32,10 +32,10 @@ from fl_space.fl.config import (
     EXPERIMENT_PRESETS as EXPERIMENT_PRESETS,
 )
 from fl_space.fl.config import (
-    FLConfig as FLConfig,
+    SCALE_PRESETS as SCALE_PRESETS,
 )
 from fl_space.fl.config import (
-    SCALE_PRESETS as SCALE_PRESETS,
+    FLConfig as FLConfig,
 )
 from fl_space.fl.config import (
     get_preset_config as get_preset_config,

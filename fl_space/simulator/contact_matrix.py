@@ -58,6 +58,37 @@ class ContactMatrix:
             if mode == "full" else []
         )
 
+    def extend(self, new_total_slots: int) -> int:
+        """
+        扩展接触矩阵到至少 new_total_slots 个时隙。
+
+        保留已有数据，新增列初始化为 -1（无接触）。
+
+        Parameters
+        ----------
+        new_total_slots : int
+            新的总时隙数（必须 >= 当前值）。
+
+        Returns
+        -------
+        int
+            实际扩展后的 num_timeslots。
+        """
+        if new_total_slots <= self.num_timeslots:
+            return self.num_timeslots
+
+        added = new_total_slots - self.num_timeslots
+        new_simple = np.full((self.num_satellites, new_total_slots), -1, dtype=int)
+        new_simple[:, :self.num_timeslots] = self._simple
+        self._simple = new_simple
+
+        if self._full:
+            for sat_entries in self._full:
+                sat_entries.extend([[] for _ in range(added)])
+
+        self.num_timeslots = new_total_slots
+        return self.num_timeslots
+
     def set_contacts(self, sat_id: int, timeslot: int, gs_ids: list[int]):
         """
         设置指定卫星在指定 timeslot 的可见地面站列表。

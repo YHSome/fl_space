@@ -20,6 +20,7 @@ FedProx 算法 — 联邦近端优化 (Federated Proximal)
 
 from __future__ import annotations
 
+from collections import deque
 import copy
 from typing import Any
 
@@ -160,6 +161,132 @@ class ProximalTrainer(LocalTrainer):
         )
 
 
+# ── FedProxSat: 准确率感知自适应 μ ──────────────────────────────
+
+
+class AdaptiveProximalTrainer(ProximalTrainer):
+    """
+    FedProxSat 自适应近端训练器。
+
+    在 ProximalTrainer 基础上增加准确率感知的动态 μ 调度：
+
+    - 当最近 N 轮准确率震荡 ≥ oscillation_threshold 时，
+      加强约束（μ↑），防止客户端漂移破坏全局模型。
+    - 当准确率趋于稳定时，
+      放松约束（μ↓），允许模型更快探索。
+
+    类似于 PID 控制器思想：震荡大 → 增加阻尼，稳定 → 减小阻尼。
+
+    Parameters
+    ----------
+    base_mu : float
+        基础近端系数（用户设定），默认 0.01。
+    mu_min : float
+        μ 下限（稳定时不会低于此值），默认 0.001。
+    mu_max : float
+        μ 上限（震荡时不会超过此值），默认 1.0。
+    oscillation_threshold : float
+        准确率震荡阈值。当窗口内 max-min ≥ 此值时触发加强约束。
+        默认 0.1（10个百分点）。
+    stability_threshold : float
+        稳定阈值。当窗口内 max-min < 此值时触发放松约束。
+        默认 0.03（3个百分点）。
+    window_size : int
+        滑动窗口大小（最近 N 轮准确率），默认 5。
+    local_epochs, batch_size, learning_rate, device :
+        与 ProximalTrainer 相同。
+    """
+
+    def __init__(
+        self,
+        local_epochs: int = 5,
+        batch_size: int = 32,
+        learning_rate: float = 0.01,
+        base_mu: float = 0.01,
+        mu_min: float = 0.001,
+        mu_max: float = 1.0,
+        oscillation_threshold: float = 0.1,
+        stability_threshold: float = 0.03,
+        window_size: int = 5,
+        device: str = "cpu",
+    ):
+        super().__init__(
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            mu=base_mu,  # 初始 μ = base_mu
+            device=device,
+        )
+        self.base_mu = base_mu
+        self.mu_min = mu_min
+        self.mu_max = mu_max
+        self.oscillation_threshold = oscillation_threshold
+        self.stability_threshold = stability_threshold
+        self._acc_window: deque[float] = deque(maxlen=window_size)
+        self._mu_history: list[float] = []  # 记录 μ 变化历史
+
+    def update_accuracy(self, acc: float) -> float:
+        """
+        根据最新准确率更新有效 μ。
+
+        由 FLServer 在每轮评估后调用。
+
+        Parameters
+        ----------
+        acc : float
+            当前轮聚合后的全局准确率。
+
+        Returns
+        -------
+        float
+            更新后的有效 μ。
+        """
+        self._acc_window.append(acc)
+
+        if len(self._acc_window) < 3:
+            # 前几轮数据不够，使用 base_mu
+            self.mu = self.base_mu
+            return self.mu
+
+        oscillation = max(self._acc_window) - min(self._acc_window)
+
+        if oscillation >= self.oscillation_threshold:
+            # 震荡大 → 加强约束（μ 增大）
+            # 因子: 1 + (oscillation/threshold - 1) * 5, 最大 10x
+            excess = (oscillation - self.oscillation_threshold) / self.oscillation_threshold
+            factor = min(1.0 + excess * 5.0, 10.0)
+            self.mu = min(self.base_mu * factor, self.mu_max)
+
+        elif oscillation < self.stability_threshold and len(self._acc_window) >= self._acc_window.maxlen:
+            # 非常稳定且窗口已满 → 逐步放松约束
+            self.mu = max(self.mu * 0.8, self.mu_min)
+
+        else:
+            # 正常范围 → 使用 base_mu
+            self.mu = self.base_mu
+
+        self._mu_history.append(self.mu)
+        return self.mu
+
+    @property
+    def effective_mu(self) -> float:
+        """当前生效的 μ 值。"""
+        return self.mu
+
+    @property
+    def mu_stats(self) -> dict[str, Any]:
+        """μ 调度统计信息。"""
+        accs = list(self._acc_window)
+        return {
+            "current_mu": round(self.mu, 6),
+            "base_mu": self.base_mu,
+            "mu_history": [round(m, 6) for m in self._mu_history[-20:]],
+            "acc_window": [round(a, 4) for a in accs],
+            "oscillation": round(max(accs) - min(accs), 4) if len(accs) >= 2 else 0,
+            "window_size": len(accs),
+        }
+
+
 # ── 便捷构建函数 ──────────────────────────────────────────────
 
 
@@ -225,9 +352,9 @@ def create_fedprox_components(
         mu=mu,
         device=device,
     )
-    aggregator = SyncWeightedAggregator(
-        min_updates=max(1, min_clients),
-    )
+    # min_updates=1: 同步 FL 中训练完全部选中客户端后才聚合，
+    # 收到的 update 数 = 实际参与客户端数，不需要额外门槛
+    aggregator = SyncWeightedAggregator(min_updates=1)
     evaluator = StandardEvaluator(device=device)
 
     return selector, trainer, aggregator, evaluator

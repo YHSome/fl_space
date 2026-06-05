@@ -15,10 +15,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-
-import numpy as np
 
 if TYPE_CHECKING:
     from fl_space.simulator.orbit_simulator import OrbitSimulator
@@ -78,7 +76,7 @@ class CommunicationScheduler:
         print(f"可通信卫星: {connected}")  # [0, 2, 5, 7]
     """
 
-    def __init__(self, simulator: "OrbitSimulator"):
+    def __init__(self, simulator: OrbitSimulator):
         self._sim = simulator
         self._contact_matrix = simulator.contact_matrix.simple_matrix
 

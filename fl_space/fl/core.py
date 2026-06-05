@@ -23,7 +23,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-
 # ── 通用数据结构 ──────────────────────────────────────────────
 
 

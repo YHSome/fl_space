@@ -4,11 +4,13 @@ Skyfield 高精度后端演示 + 与环境模块集成测试
 运行: python examples/demo_skyfield.py
 """
 
-import sys, os
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from fl_space.environment import CelestialBody, GroundStationNetwork
-from fl_space.orbit import ConstellationConfig, SKYFIELD_AVAILABLE
+from fl_space.environment import CelestialBody
+from fl_space.orbit import SKYFIELD_AVAILABLE
 from fl_space.simulator import OrbitSimulator
 
 
@@ -47,7 +49,7 @@ def demo_precise_body_params():
     print("  JPL 星历精确参数对比")
     print("=" * 60)
 
-    from fl_space.orbit.skyfield_backend import get_precise_body_params, list_supported_bodies
+    from fl_space.orbit.skyfield_backend import list_supported_bodies
 
     bodies = list_supported_bodies()
     print(f"  支持的天体: {bodies}\n")
@@ -148,7 +150,7 @@ def demo_skyfield_visibility_windows():
         min_elevation_deg=10.0,
     )
 
-    print(f"\n  DEMO-SAT 对 Beijing [2024-06-01, 12h, min_elev=10°]:")
+    print("\n  DEMO-SAT 对 Beijing [2024-06-01, 12h, min_elev=10°]:")
     print(f"  共 {len(windows)} 个可见窗口")
     for i, w in enumerate(windows[:5]):
         print(f"    [{i}] rise={w.get('rise_utc','?')} -> set={w.get('set_utc','?')}, "

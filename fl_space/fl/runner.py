@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fl_space.fl.config import FLConfig, DATASET_PRESETS, get_preset_config
+from fl_space.fl.config import DATASET_PRESETS, FLConfig, get_preset_config
 from fl_space.fl.core import (
     Aggregator,
     ClientSelector,
@@ -39,8 +39,8 @@ from fl_space.fl.core import (
     LocalTrainer,
 )
 from fl_space.fl.models import get_model
-from fl_space.fl.server import FLServer
 from fl_space.fl.scheduler import CommunicationScheduler
+from fl_space.fl.server import FLServer
 
 # PyTorch 可选依赖
 try:
@@ -112,7 +112,7 @@ class FLRunner:
         scheduler: CommunicationScheduler | None = None,
         device: str = "cpu",
         **overrides: Any,
-    ) -> "FLRunner":
+    ) -> FLRunner:
         """
         从预设配置创建 Runner。
 
@@ -197,12 +197,13 @@ class FLRunner:
         dataset_name: str = "mnist",
         iid: bool = True,
         alpha: float = 0.5,
+        classes_per_client: int | None = None,
         data_dir: str = "./data",
     ) -> None:
         """
         加载数据集并分配到客户端。
 
-        支持 IID（均匀随机分配）和 non-IID（Dirichlet 分配）。
+        支持 IID（均匀随机分配）和 non-IID（Dirichlet 或固定类别数）。
 
         Parameters
         ----------
@@ -269,10 +270,12 @@ class FLRunner:
         n_clients = self.config.num_clients
         client_data_indices = self._partition_data(
             train_ds, n_clients, iid=iid, alpha=alpha,
+            classes_per_client=classes_per_client,
         )
 
         # 创建 DataLoader
         self._train_loaders = {}
+        num_workers = getattr(self.config, 'num_workers', 0) or 0
         for cid, indices in enumerate(client_data_indices):
             subset = Subset(train_ds, indices)
             self._train_loaders[cid] = DataLoader(
@@ -280,12 +283,16 @@ class FLRunner:
                 batch_size=self.config.batch_size,
                 shuffle=True,
                 drop_last=False,
+                num_workers=num_workers,
+                pin_memory=(self.config.device == "cuda"),
             )
 
         self._test_loader = DataLoader(
             test_ds,
             batch_size=self.config.batch_size * 2,
             shuffle=False,
+            num_workers=num_workers,
+            pin_memory=(self.config.device == "cuda"),
         )
 
     def _partition_data(
@@ -294,6 +301,7 @@ class FLRunner:
         n_clients: int,
         iid: bool = True,
         alpha: float = 0.5,
+        classes_per_client: int | None = None,
     ) -> list[list[int]]:
         """
         将数据集划分为 n_clients 份。
@@ -307,7 +315,11 @@ class FLRunner:
         iid : bool
             True 为 IID，False 为 non-IID (Dirichlet)。
         alpha : float
-            Dirichlet 参数。
+            Dirichlet 参数（仅 non-IID 且未指定 classes_per_client）。
+        classes_per_client : int | None
+            每个客户端限定的类别数，如 2 表示每个卫星只拿 2 类数字。
+            使用滑动窗口分配：client i 拿到 i, i+1, ... (mod n_classes)。
+            指定此参数后忽略 alpha。
 
         Returns
         -------
@@ -326,20 +338,40 @@ class FLRunner:
                 indices[i * split_size:(i + 1) * split_size].tolist()
                 for i in range(n_clients)
             ]
-            # 余数分配到最后一个客户端
             remainder = indices[n_clients * split_size:]
             if len(remainder) > 0:
                 client_indices[-1].extend(remainder.tolist())
+        elif classes_per_client is not None:
+            # 固定类别数：每客户端精确限定 k 个类别（滑动窗口 cyclic）
+            client_indices = [[] for _ in range(n_clients)]
+            k = min(classes_per_client, n_classes)
+
+            # 预计算每个类别分配给哪些客户端
+            class_to_clients: dict[int, list[int]] = {c: [] for c in range(n_classes)}
+            for cid in range(n_clients):
+                for offset in range(k):
+                    cls = (cid + offset) % n_classes
+                    class_to_clients[cls].append(cid)
+
+            # 按类别分配：该类样本均分给包含它的客户端
+            for c in range(n_classes):
+                class_indices = np.where(targets == c)[0]
+                np.random.shuffle(class_indices)
+                n_holders = len(class_to_clients[c])
+                split_sz = len(class_indices) // n_holders
+                start = 0
+                for h_idx, cid in enumerate(class_to_clients[c]):
+                    end = start + split_sz + (1 if h_idx < len(class_indices) % n_holders else 0)
+                    client_indices[cid].extend(class_indices[start:end].tolist())
+                    start = end
         else:
             # Non-IID：Dirichlet 分布
-            # 每个类别按 Dirichlet(alpha) 比例分配给各客户端
             client_indices = [[] for _ in range(n_clients)]
 
             for c in range(n_classes):
                 class_indices = np.where(targets == c)[0]
                 np.random.shuffle(class_indices)
 
-                # Dirichlet 分配比例
                 proportions = np.random.dirichlet(
                     np.repeat(alpha, n_clients)
                 )
@@ -347,7 +379,6 @@ class FLRunner:
                     proportions * len(class_indices)
                 ).astype(int)
 
-                # 修正舍入误差
                 diff = len(class_indices) - proportions.sum()
                 proportions[-1] += diff
 
@@ -387,6 +418,7 @@ class FLRunner:
         dataset_name: str = "mnist",
         iid: bool = True,
         alpha: float = 0.5,
+        classes_per_client: int | None = None,
         data_dir: str = "./data",
         verbose: bool = True,
     ) -> list[FLRoundResult]:
@@ -423,7 +455,7 @@ class FLRunner:
                 print(f"轮次 {r.round_num}: 准确率 {r.eval_metrics['accuracy']}")
         """
         if verbose:
-            print(f"=== SpaceFL 实验 ===")
+            print("=== SpaceFL 实验 ===")
             print(f"  算法: {self.config.algorithm}")
             print(f"  数据集: {dataset_name}")
             print(f"  客户端: {self.config.num_clients}")
@@ -438,12 +470,16 @@ class FLRunner:
             dataset_name=dataset_name,
             iid=iid,
             alpha=alpha,
+            classes_per_client=classes_per_client,
             data_dir=data_dir,
         )
 
         # 2. 模型准备
         if verbose:
             print("[2/3] 创建模型...")
+        # 固定 PyTorch 随机种子，确保模型初始化可复现
+        if TORCH_AVAILABLE and hasattr(self.config, 'seed') and self.config.seed is not None:
+            torch.manual_seed(self.config.seed)
         ds_preset = DATASET_PRESETS.get(dataset_name, DATASET_PRESETS["mnist"])
         self.prepare_model(
             model_name=ds_preset["model"],

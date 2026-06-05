@@ -95,6 +95,15 @@
 - 特别包含 AI 辅助开发准则（第10章），涵盖提示词模板、AI代码检查流程、严禁事项
 - 附录提供常见模式速查和常见错误示例
 
+## AI 修改代码强制性规范 (2026-06-05)
+- **每次修改代码后，Agent 必须自动运行 ruff 检查并修复**：
+  1. 修改代码完成后，立即运行 `ruff check --fix <修改的文件>` 
+  2. 然后运行 `ruff format <修改的文件>` 确保格式一致
+  3. 如有无法自动修复的问题（ruff 仍报错），手动修复后再运行上述命令
+  4. 目标：修改后的代码通过 ruff 零告警
+- **pyproject.toml 已配置忽略规则**: RUF001（中文全角标点）、RUF002（中文全角标点）、E501（行过长由 formatter 处理）等
+- **锁定版本**: Ruff 0.15.15，行宽 100
+
 ## Step 3 完成内容 — FL算法模块 (2026-06-01)
 
 ### 架构设计 — 四组件解耦
@@ -144,4 +153,28 @@
 ### 测试结果
 - 全部通过：slot(train=0) 22min / slot(train=3) 37min / slot(全成本) 46min / physics 1h13min
 - 每轮输出显示时间分解（下载/训练/上传耗时）
+
+## 性能优化 + 实验系统 (2026-06-04)
+
+### 性能优化
+1. **并行客户端训练** (`server.py`): `_train_clients_parallel()` 使用 ThreadPoolExecutor，`num_train_workers` 控制并行度
+2. **DataLoader workers** (`runner.py`): `num_workers` 传入 DataLoader，GPU自动 `pin_memory=True`
+3. **早停机制** (`server.py`): `early_stop_acc` 触发自动停止
+
+### 新增文件
+- `fl_space/utils/__init__.py` + `fl_space/utils/viz.py` — 可视化工具（热力图、准确率对比、时间分解、GS地图、报告器）
+- `examples/run_spacefl_experiment.py` — 完整太空FL实验脚本
+
+### 实验设计
+- **异构轨道**: 10卫星，高度 350-800 km 均匀分布，同轨道面（倾角53°），不同周期自然时间差
+- **地面站对比**: 1(Beijing) / 3(+Svalbard/Santiago) / 5(+Singapore/Washington)
+- **FedProx 同步**: 300轮，早停阈值90%，标准FL基线对比（无轨道约束）
+- **输出**: JSON报告 + 接触热力图 + 准确率曲线 + 时间分解 + GS地图 + GS对比图
+
+### CLI
+- 新增 `fl-space experiment` 子命令，完整参数化（--sats, --gs, --rounds, --device, --train-workers, --data-workers, --altitudes 等）
+
+### 烟雾测试验证
+- 3卫星/1GS/5轮完整流水线正常
+- 基线FL 5轮达93.57%，SpaceFL(1GS)受轨道约束仅6%接触率（预期行为）
 

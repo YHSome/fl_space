@@ -16,10 +16,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
-
 import math
-
+from typing import Any
 
 # ── 时间分解数据结构 ──────────────────────────────────────────
 
@@ -218,15 +216,15 @@ class TimeModel(ABC):
 
     # ── 工厂方法 ──────────────────────────────────────────
 
-    _BUILTIN: dict[str, type["TimeModel"]] = {}
+    _BUILTIN: dict[str, type[TimeModel]] = {}
 
     @classmethod
-    def register(cls, name: str, model_cls: type["TimeModel"]) -> None:
+    def register(cls, name: str, model_cls: type[TimeModel]) -> None:
         """注册内置时间模型。"""
         cls._BUILTIN[name] = model_cls
 
     @classmethod
-    def create(cls, spec: str, **kwargs: Any) -> "TimeModel":
+    def create(cls, spec: str, **kwargs: Any) -> TimeModel:
         """
         工厂方法：根据规格字符串创建时间模型实例。
 
@@ -268,7 +266,7 @@ class TimeModel(ABC):
         )
 
     @classmethod
-    def _import_from_file(cls, spec: str, **kwargs: Any) -> "TimeModel":
+    def _import_from_file(cls, spec: str, **kwargs: Any) -> TimeModel:
         """
         从文件路径动态导入时间模型类。
 

@@ -4,6 +4,7 @@ __pycache__/
 *$py.class
 *.so
 *.egg-info/
+*.egg
 dist/
 build/
 .eggs/
@@ -12,6 +13,16 @@ build/
 .vscode/
 .idea/
 
+# CodeBuddy
+.codebuddy/
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Archives
+*.tar.gz
+*.zip
+
+# Results
+results/

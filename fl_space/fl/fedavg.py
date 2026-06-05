@@ -91,6 +91,51 @@ class RandomSelector(ClientSelector):
         return [c.client_id for c in selected]
 
 
+class CappedSelector(ClientSelector):
+    """
+    带数量上限的随机客户端选择器。
+
+    从可连接客户端中随机选取，但不超过 max_count 个。
+    适用于 SpaceFL：max_count = min(GS数, 在线卫星数)。
+
+    Parameters
+    ----------
+    max_count : int
+        最多选择的客户端数。
+    min_clients : int
+        最少参与客户端数。
+    seed : int | None
+        随机种子。
+    """
+
+    def __init__(
+        self,
+        max_count: int = 3,
+        min_clients: int = 1,
+        seed: int | None = None,
+    ):
+        self.max_count = max_count
+        self.min_clients = min_clients
+        self._rng = random.Random(seed)
+
+    def select(
+        self,
+        clients: list[ClientState],
+        round_num: int,
+        **kwargs: Any,
+    ) -> list[int]:
+        connected = [c for c in clients if c.is_connected]
+        if not connected:
+            return []
+
+        n_select = max(self.min_clients, len(connected))
+        n_select = min(n_select, self.max_count)
+        n_select = min(n_select, len(connected))
+
+        selected = self._rng.sample(connected, n_select)
+        return [c.client_id for c in selected]
+
+
 # ── 2. 本地训练器 ────────────────────────────────────────────
 
 
@@ -203,7 +248,7 @@ class SyncWeightedAggregator(Aggregator):
         实际使用中通常等于目标选中的客户端数。
     """
 
-    def __init__(self, min_updates: int = 2):
+    def __init__(self, min_updates: int = 1):
         self.min_updates = min_updates
 
     def should_aggregate(
@@ -212,8 +257,14 @@ class SyncWeightedAggregator(Aggregator):
         round_num: int,
         **kwargs: Any,
     ) -> bool:
-        """当收集到 min_updates 个更新时触发聚合。"""
-        return len(collected_updates) >= self.min_updates
+        """
+        当收集到至少 1 个更新时触发聚合。
+        
+        在同步 FL 中，服务器先选定客户端、训练全部完成后收集更新，
+        因此收到的 update 数量 = 实际参与的客户端数。
+        min_updates 仅作为安全下限（避免空聚合），默认为 1。
+        """
+        return len(collected_updates) >= max(self.min_updates, 1)
 
     def aggregate(
         self,
@@ -387,9 +438,9 @@ def create_fedavg_components(
         learning_rate=learning_rate,
         device=device,
     )
-    aggregator = SyncWeightedAggregator(
-        min_updates=max(1, min_clients),
-    )
+    # min_updates=1: 同步 FL 中训练完全部选中客户端后才聚合，
+    # 收到的 update 数 = 实际参与客户端数，不需要额外门槛
+    aggregator = SyncWeightedAggregator(min_updates=1)
     evaluator = StandardEvaluator(device=device)
 
     return selector, trainer, aggregator, evaluator

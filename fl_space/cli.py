@@ -1,12 +1,14 @@
 """
-fl-space CLI — 命令行调参与实验统筹工具
+fls CLI — SpaceFL 命令行调参与实验统筹工具
 
 提供统一的命令行入口，覆盖：
-    - simulate  : 轨道接触模拟
-    - train     : FL 训练实验
-    - list      : 查看内置预设、模型、卫星类型
-    - export    : 导出模拟结果 JSON
-    - info      : 系统/环境信息
+    - simulate    : 轨道接触模拟
+    - train       : FL 训练实验
+    - experiment  : SpaceFL 完整太空实验
+    - quick-test  : FedProxSat 快速测试（自适应 μ）
+    - list        : 查看内置预设、模型、卫星类型
+    - export      : 导出模拟结果 JSON
+    - info        : 系统/环境信息
 
 所有子命令均支持 --config 参数加载 JSON 配置文件，
 CLI 参数将覆盖 JSON 中的对应字段。
@@ -19,12 +21,13 @@ CLI 参数将覆盖 JSON 中的对应字段。
 
 使用示例::
 
-    fl-space simulate --sats 10 --stations 5 --hours 24
-    fl-space simulate --config my_sim.json --hours 48    # JSON + CLI 覆盖
-    fl-space train --algo fedprox --dataset cifar10 --rounds 100
-    fl-space train --config my_fl.json --lr 0.001        # JSON + CLI 覆盖
-    fl-space list presets
-    fl-space list models
+    fls simulate --sats 10 --stations 5 --hours 24
+    fls simulate --config my_sim.json --hours 48       # JSON + CLI 覆盖
+    fls train --algo fedprox --dataset cifar10 --rounds 100
+    fls train --config my_fl.json --lr 0.001           # JSON + CLI 覆盖
+    fls quick-test --mu 0.01 --gs 5                     # FedProxSat 快速测试
+    fls list presets
+    fls list models
 """
 
 from __future__ import annotations
@@ -32,7 +35,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from dataclasses import asdict
 from typing import Any
 
 
@@ -91,7 +93,7 @@ def _merge_config(
     # 先加载 JSON 配置
     if json_path:
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
+            with open(json_path, encoding="utf-8") as f:
                 json_data = json.load(f)
             config.update(json_data)
             print(f"  [配置] 加载 {json_path}")
@@ -113,19 +115,18 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
     """
     运行轨道接触模拟。
 
-    用法: fl-space simulate [参数]
+    用法: fls simulate [参数]
 
     支持 --config 加载 JSON 配置文件，CLI 参数覆盖 JSON 字段。
     JSON 配置格式见 CLI_REFERENCE.md。
 
     示例:
-        fl-space simulate
-        fl-space simulate --sats 20 --stations 10 --hours 48
-        fl-space simulate --backend skyfield --altitude 550 --inclination 53
-        fl-space simulate --config my_sim.json --hours 48
-        fl-space simulate --sats 10 --stations 5 --output result.json
+        fls simulate
+        fls simulate --sats 20 --stations 10 --hours 48
+        fls simulate --backend skyfield --altitude 550 --inclination 53
+        fls simulate --config my_sim.json --hours 48
+        fls simulate --sats 10 --stations 5 --output result.json
     """
-    import json as _json
 
     from fl_space.environment import CelestialBody, create_default_network
     from fl_space.orbit import create_circular_orbit
@@ -183,7 +184,7 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
         )
         orbits.append(orb)
 
-    print(f"=== 轨道接触模拟 ===")
+    print("=== 轨道接触模拟 ===")
     print(f"  卫星数: {n_sats}")
     print(f"  地面站: {n_gs}")
     print(f"  时长: {args.hours} 小时")
@@ -206,7 +207,7 @@ def _cmd_simulate(args: argparse.Namespace) -> int:
 
     # 输出摘要
     print()
-    print(f"=== 结果摘要 ===")
+    print("=== 结果摘要 ===")
     contact_rate = sim.stats.get("contact_rate", 0)
     print(f"  接触率: {contact_rate:.2%}")
     print(f"  总接触数: {sim.stats.get('total_contacts', 'N/A')}")
@@ -256,17 +257,17 @@ def _cmd_train(args: argparse.Namespace) -> int:
     """
     运行 FL 训练实验。
 
-    用法: fl-space train [参数]
+    用法: fls train [参数]
 
     支持 --config 加载 JSON 配置文件，CLI 参数覆盖 JSON 字段。
     JSON 配置格式见 CLI_REFERENCE.md。
 
     示例:
-        fl-space train
-        fl-space train --algo fedprox --dataset cifar10 --rounds 100
-        fl-space train --algo fedavg --scale medium --epochs 10 --lr 0.01
-        fl-space train --config my_fl.json --lr 0.001
-        fl-space train --algo fedbuff --buffer-size 10 --non-iid
+        fls train
+        fls train --algo fedprox --dataset cifar10 --rounds 100
+        fls train --algo fedavg --scale medium --epochs 10 --lr 0.01
+        fls train --config my_fl.json --lr 0.001
+        fls train --algo fedbuff --buffer-size 10 --non-iid
     """
     if not _check_torch():
         print("错误: FL 训练需要 PyTorch。请运行: pip install fl-space[full]")
@@ -320,8 +321,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
     # 如果有 --config，用自定义组件构建 Runner
     if args.config:
         from fl_space.fl.fedavg import create_fedavg_components
-        from fl_space.fl.fedprox import create_fedprox_components
         from fl_space.fl.fedbuff import create_fedbuff_components
+        from fl_space.fl.fedprox import create_fedprox_components
 
         # 将 CLI 覆盖合并到 base_config
         for k, v in overrides.items():
@@ -365,7 +366,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
             **overrides,
         )
 
-    print(f"=== FL 训练实验 ===")
+    print("=== FL 训练实验 ===")
     print(f"  算法: {algo}")
     print(f"  数据集: {args.dataset}")
     print(f"  规模: {args.scale}")
@@ -387,7 +388,7 @@ def _cmd_train(args: argparse.Namespace) -> int:
         print(f"  staleness降权: {args.staleness}")
     print()
 
-    history = runner.run(
+    _history = runner.run(
         dataset_name=args.dataset,
         iid=not args.non_iid,
         alpha=args.alpha,
@@ -424,13 +425,13 @@ def _cmd_list(args: argparse.Namespace) -> int:
     """
     列出可用资源。
 
-    用法: fl-space list <资源类型>
+    用法: fls list <资源类型>
 
     示例:
-        fl-space list presets
-        fl-space list models
-        fl-space list satellites
-        fl-space list experiments
+        fls list presets
+        fls list models
+        fls list satellites
+        fls list experiments
     """
     resource = args.resource
 
@@ -491,11 +492,11 @@ def _cmd_export(args: argparse.Namespace) -> int:
     """
     将模拟结果导出为 JSON。
 
-    用法: fl-space export [参数]
+    用法: fls export [参数]
 
     示例:
-        fl-space export --sats 10 --stations 5 --output sim_result.json
-        fl-space export --body mars --sats 5 --output mars_sim.json
+        fls export --sats 10 --stations 5 --output sim_result.json
+        fls export --body mars --sats 5 --output mars_sim.json
     """
     from fl_space.environment import CelestialBody, create_default_network
     from fl_space.orbit import create_circular_orbit
@@ -568,14 +569,135 @@ def _cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── 子命令：experiment ────────────────────────────────────────
+
+
+def _cmd_experiment(args: argparse.Namespace) -> int:
+    """
+    运行 SpaceFL 完整太空实验。
+
+    用法: fls experiment [参数]
+
+    示例:
+        fls experiment --sats 10 --gs 1 3 5 --rounds 300
+        fls experiment --device cuda --train-workers 4 --output my_results
+    """
+    if not _check_torch():
+        print("错误: 实验需要 PyTorch。请运行: pip install fl-space[full]")
+        return 1
+
+    # 导入实验模块
+    try:
+        from examples.run_spacefl_experiment import run_experiment_suite
+    except ImportError:
+        # 尝试从当前目录导入
+        import importlib.util
+        import os as _os
+        spec_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "examples", "run_spacefl_experiment.py",
+        )
+        if not _os.path.exists(spec_path):
+            print(f"错误: 找不到实验模块: {spec_path}")
+            return 1
+        spec = importlib.util.spec_from_file_location("spacefl_experiment", spec_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        run_experiment_suite = module.run_experiment_suite
+
+    # 处理 altitudes
+    altitudes = args.altitudes
+    if altitudes is None:
+        altitudes = [
+            350 + i * (800 - 350) / max(args.sats - 1, 1)
+            for i in range(args.sats)
+        ] if args.sats > 1 else [500.0]
+
+    output_dir = args.output
+    import os as _os
+    _os.makedirs(output_dir, exist_ok=True)
+
+    # 运行实验
+    import time as _time
+
+    t_start = _time.time()
+    _report = run_experiment_suite(
+        gs_counts=args.gs,
+        num_satellites=args.sats,
+        num_rounds=args.rounds,
+        altitudes_km=altitudes,
+        inclination_deg=args.inclination,
+        dataset=args.dataset,
+        device=args.device,
+        local_epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        mu=args.mu,
+        early_stop_acc=args.early_stop,
+        num_train_workers=args.train_workers,
+        num_workers=args.data_workers,
+        sim_hours=args.sim_hours,
+        timeslot_duration_min=args.timeslot_min,
+        seed=args.seed,
+        output_dir=output_dir,
+        verbose=not args.quiet,
+    )
+
+    total_elapsed = _time.time() - t_start
+    if not args.quiet:
+        print(f"\n总耗时: {total_elapsed:.1f}s ({total_elapsed/60:.1f}min)")
+        print(f"输出目录: {_os.path.abspath(output_dir)}")
+
+    return 0
+
+
+# ── 子命令：quick-test ───────────────────────────────────────
+
+
+def _cmd_quick_test(args: argparse.Namespace) -> int:
+    """
+    运行 FedProxSat 快速测试（自适应 μ）。
+
+    用法: fls quick-test [参数]
+
+    示例:
+        fls quick-test
+        fls quick-test --mu 0.1 --no-adaptive
+        fls quick-test --mu 0.01 --mu-min 0.001 --mu-max 0.5 --gs 5
+        fls quick-test --oscillation-threshold 0.08 --stability-threshold 0.02
+    """
+    if not _check_torch():
+        print("错误: 实验需要 PyTorch。请运行: pip install fl-space[full]")
+        return 1
+
+    try:
+        from examples.quick_test import run_quick_test
+    except ImportError:
+        import importlib.util
+        import os as _os
+        spec_path = _os.path.join(
+            _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+            "examples", "quick_test.py",
+        )
+        if not _os.path.exists(spec_path):
+            print(f"错误: 找不到 quick_test.py: {spec_path}")
+            return 1
+        spec = importlib.util.spec_from_file_location("quick_test", spec_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        run_quick_test = module.run_quick_test
+
+    return run_quick_test(args)
+
+
 # ── 子命令：info ─────────────────────────────────────────────
 
 
-def _cmd_info(args: argparse.Namespace) -> int:  # noqa: ARG001
+def _cmd_info(args: argparse.Namespace) -> int:
     """
     显示系统与环境信息。
 
-    用法: fl-space info
+    用法: fls info
     """
     import platform
 
@@ -591,19 +713,19 @@ def _cmd_info(args: argparse.Namespace) -> int:  # noqa: ARG001
     print(f"  操作系统: {platform.system()} {platform.release()}")
     print(f"  PyTorch:  {ok + ' 可用' if _check_torch() else no + ' 未安装'}")
     print(f"  Skyfield: {ok + ' 可用' if _check_skyfield() else no + ' 未安装'}")
-    print(f"  NumPy:    ", end="")
+    print("  NumPy:    ", end="")
     try:
         import numpy
         print(f"{ok} {numpy.__version__}")
     except ImportError:
         print(f"{no} 未安装")
-    print(f"  Matplotlib: ", end="")
+    print("  Matplotlib: ", end="")
     try:
         import matplotlib
         print(f"{ok} {matplotlib.__version__}")
     except ImportError:
         print(f"{no} 未安装")
-    print(f"  CUDA:     ", end="")
+    print("  CUDA:     ", end="")
     try:
         import torch
         cuda_ok = torch.cuda.is_available()
@@ -627,16 +749,17 @@ def build_parser() -> argparse.ArgumentParser:
         配置好的参数解析器。
     """
     parser = argparse.ArgumentParser(
-        prog="fl-space",
+        prog="fls",
         description="SpaceFL — 太空联邦学习研究框架命令行工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 使用示例:
-  fl-space simulate --sats 10 --stations 5 --hours 24
-  fl-space train --algo fedprox --dataset cifar10 --rounds 100
-  fl-space list presets
-  fl-space export --body mars --sats 5 --output mars.json
-  fl-space info
+  fls simulate --sats 10 --stations 5 --hours 24
+  fls train --algo fedprox --dataset cifar10 --rounds 100
+  fls quick-test --mu 0.01 --gs 5
+  fls list presets
+  fls export --body mars --sats 5 --output mars.json
+  fls info
         """,
     )
 
@@ -743,6 +866,91 @@ def build_parser() -> argparse.ArgumentParser:
                            help="每时间槽分钟数 (默认: 1.0)")
     p_export.set_defaults(func=_cmd_export)
 
+    # ── experiment ─────────────────────────────────────────
+
+    p_exp = sub.add_parser(
+        "experiment",
+        help="运行 SpaceFL 完整太空实验（异构轨道 + 多GS对比 + 基线FL）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  fls experiment --sats 10 --gs 1 3 5 --rounds 300
+  fls experiment --sats 10 --gs 1 3 5 --device cuda --train-workers 4
+  fls experiment --dataset cifar10 --sim-hours 336 --output my_results
+        """,
+    )
+    p_exp.add_argument("--sats", type=int, default=10, help="卫星数量 (默认: 10)")
+    p_exp.add_argument("--gs", type=int, nargs="+", default=[1, 3, 5],
+                       help="地面站数量列表 (默认: 1 3 5)")
+    p_exp.add_argument("--rounds", type=int, default=300, help="最大训练轮次 (默认: 300)")
+    p_exp.add_argument("--epochs", type=int, default=3, help="本地训练 epoch (默认: 3)")
+    p_exp.add_argument("--batch-size", type=int, default=32, help="batch size (默认: 32)")
+    p_exp.add_argument("--lr", type=float, default=0.01, help="学习率 (默认: 0.01)")
+    p_exp.add_argument("--mu", type=float, default=0.01, help="FedProx mu (默认: 0.01)")
+    p_exp.add_argument("--dataset", choices=["mnist", "fashion_mnist", "cifar10"],
+                       default="mnist", help="数据集 (默认: mnist)")
+    p_exp.add_argument("--device", choices=["cpu", "cuda"], default="cpu",
+                       help="计算设备 (默认: cpu)")
+    p_exp.add_argument("--early-stop", type=float, default=0.90,
+                       help="早停准确率阈值 (默认: 0.90)")
+    p_exp.add_argument("--train-workers", type=int, default=1,
+                       help="并行训练线程数 (默认: 1)")
+    p_exp.add_argument("--data-workers", type=int, default=0,
+                       help="DataLoader 并行进程数 (默认: 0)")
+    p_exp.add_argument("--inclination", type=float, default=53.0,
+                       help="轨道倾角° (默认: 53)")
+    p_exp.add_argument("--sim-hours", type=float, default=168.0,
+                       help="模拟时长/小时 (默认: 168 = 7天)")
+    p_exp.add_argument("--timeslot-min", type=float, default=1.0,
+                       help="每 timeslot 分钟数 (默认: 1.0)")
+    p_exp.add_argument("--seed", type=int, default=42, help="随机种子 (默认: 42)")
+    p_exp.add_argument("--output", "-o", type=str, default="experiment_output",
+                       help="输出目录 (默认: experiment_output)")
+    p_exp.add_argument("--altitudes", type=float, nargs="+", default=None,
+                       help="自定义卫星高度列表 km (默认: 350-800 均匀)")
+    p_exp.add_argument("--quiet", "-q", action="store_true", help="安静模式")
+    p_exp.set_defaults(func=_cmd_experiment)
+
+    # ── quick-test ────────────────────────────────────────
+
+    p_qt = sub.add_parser(
+        "quick-test",
+        help="FedProxSat 快速测试（自适应 μ，10卫星+GS地面站+2类/卫星）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  fls quick-test                                    # 默认自适应 μ=0.01
+  fls quick-test --mu 0.1 --no-adaptive             # 固定 μ (传统 FedProx)
+  fls quick-test --mu 0.01 --mu-min 0.001 --mu-max 0.5  # 自定义自适应范围
+  fls quick-test --oscillation-threshold 0.08        # 调整灵敏度
+        """,
+    )
+    p_qt.add_argument("--output", "-o", default="results",
+                      help="输出目录 (默认: results)")
+    p_qt.add_argument("--mu", type=float, default=0.01,
+                      help="基础 μ / 固定 μ (默认: 0.01)")
+    p_qt.add_argument("--mu-min", type=float, default=0.001,
+                      help="自适应 μ 下限 (默认: 0.001)")
+    p_qt.add_argument("--mu-max", type=float, default=1.0,
+                      help="自适应 μ 上限 (默认: 1.0)")
+    p_qt.add_argument("--oscillation-threshold", type=float, default=0.1,
+                      help="震荡阈值，超过触发 μ↑ (默认: 0.1)")
+    p_qt.add_argument("--stability-threshold", type=float, default=0.03,
+                      help="稳定阈值，低于触发 μ↓ (默认: 0.03)")
+    p_qt.add_argument("--no-adaptive", action="store_true",
+                      help="禁用自适应 μ，使用固定 μ (传统 FedProx)")
+    p_qt.add_argument("--rounds", type=int, default=300,
+                      help="最大轮数 (默认: 300)")
+    p_qt.add_argument("--epochs", type=int, default=2,
+                      help="本地epoch (默认: 2)")
+    p_qt.add_argument("--early-stop", type=float, default=0.9,
+                      help="早停阈值 (默认: 0.9)")
+    p_qt.add_argument("--gs", type=int, default=5,
+                      help="地面站数 (默认: 5)")
+    p_qt.add_argument("--quiet", "-q", action="store_true",
+                      help="安静模式")
+    p_qt.set_defaults(func=_cmd_quick_test)
+
     # ── info ──────────────────────────────────────────────
 
     p_info = sub.add_parser("info", help="显示系统与环境信息")
@@ -766,7 +974,7 @@ def _cmd_generate_config(args: argparse.Namespace, filepath: str) -> int:
 
     if cmd == "simulate":
         template = {
-            "_comment": "SpaceFL 模拟器配置模板 — 修改后使用 fl-space simulate --config THIS_FILE.json",
+            "_comment": "SpaceFL 模拟器配置模板 — 修改后使用 fls simulate --config THIS_FILE.json",
             "num_satellites": 10,
             "num_ground_stations": 5,
             "orbit_altitude_km": 500.0,
@@ -789,7 +997,7 @@ def _cmd_generate_config(args: argparse.Namespace, filepath: str) -> int:
         }
     else:
         template = {
-            "_comment": "SpaceFL FL 实验配置模板 — 修改后使用 fl-space train --config THIS_FILE.json",
+            "_comment": "SpaceFL FL 实验配置模板 — 修改后使用 fls train --config THIS_FILE.json",
             "algorithm": "fedavg",
             "num_rounds": 50,
             "num_clients": 10,
@@ -808,7 +1016,7 @@ def _cmd_generate_config(args: argparse.Namespace, filepath: str) -> int:
         json.dump(template, f, ensure_ascii=False, indent=2)
 
     print(f"配置模板已生成: {filepath}")
-    print(f"  编辑此文件后使用: fl-space {cmd} --config {filepath}")
+    print(f"  编辑此文件后使用: fls {cmd} --config {filepath}")
     return 0
 
 

@@ -1,20 +1,6 @@
-# fl-space CLI 参考手册
+# fls CLI 参考手册
 
-> SpaceFL 命令行工具 — 完整的调参、实验和外接配置指南
-
----
-
-## 目录
-
-1. [快速开始](#1-快速开始)
-2. [子命令速查](#2-子命令速查)
-3. [simulate — 轨道接触模拟](#3-simulate--轨道接触模拟)
-4. [train — FL 训练实验](#4-train--fl-训练实验)
-5. [list — 查看资源](#5-list--查看资源)
-6. [export — 导出模拟结果](#6-export--导出模拟结果)
-7. [info — 系统环境](#7-info--系统环境)
-8. [外接自定义配置](#8-外接自定义配置)
-9. [JSON 配置文件参考](#9-json-配置文件参考)
+> SpaceFL 三层指令架构：`tune` 调参 → `mount` 挂载 → `run` 运行
 
 ---
 
@@ -24,409 +10,407 @@
 # 安装
 pip install -e "."
 
-# 验证
-fl-space info
+# 查看完整帮助
+fls help
 
-# 第一个模拟
-fl-space simulate --sats 5 --stations 3 --hours 6
+# 查看环境信息
+fls info
 ```
 
 ---
 
-## 2. 子命令速查
+## 2. 指令架构总览
 
-| 命令 | 功能 | 典型场景 |
-|------|------|---------|
-| `simulate` | 轨道接触模拟 | 探索不同星座配置的接触率 |
-| `train` | FL 训练实验 | 对比 FedAvg/FedProx/FedBuff 算法效果 |
-| `list` | 查看内置资源 | 查询可用预设、模型、卫星类型 |
-| `export` | 导出模拟结果 | 保存接触矩阵到 JSON 供分析 |
-| `info` | 系统环境 | 检查依赖安装状态 |
+```
+fls
+├── help                        显示分类帮助
+├── info                        系统与环境信息
+├── completion install          安装 Tab 补全
+│
+├── tune <参数> <值>            调参指令 — 管理超参数
+│   ├── lr, rounds, epochs, batch, mu, seed, ...
+│   ├── show                    查看当前调参
+│   └── reset                   重置为默认值
+│
+├── mount <组件> <值>           挂载指令 — 选择算法 / 组件
+│   ├── algo, isl, backend, body, distribution, ...
+│   ├── config <path>           加载 JSON 配置文件
+│   ├── show                    查看当前挂载
+│   └── clear                   重置为默认值
+│
+└── run <实验类型> [--覆盖]     运行指令 — 执行实验
+    ├── simulate                轨道接触模拟
+    ├── train                   FL 训练实验
+    ├── experiment              完整太空实验 (FedAvg/FedProx 网格)
+    ├── quick-test              FedProxSat 快速测试
+    ├── list [资源]             查看内置资源
+    ├── export                  导出模拟结果 JSON
+    ├── serve                   启动 CesiumJS 3D 可视化
+    └── show                    查看完整 session 状态
+```
+
+**核心设计：**
+- `tune` / `mount` 的修改持久化到 `.fls_session.json`
+- `run` 消费当前 session，支持 `--` 参数覆盖
+- 参数优先级：**CLI 覆盖 > session 值 > 默认值**
 
 ---
 
-## 3. simulate — 轨道接触模拟
+## 3. 工作流示例
 
-### 3.1 基本用法
-
-```powershell
-fl-space simulate [参数]
-```
-
-### 3.2 完整参数表
-
-| 参数 | 简写 | 类型 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `--sats` | `-n` | int | 5 | 卫星数量 |
-| `--stations` | `-g` | int | 3 | 地面站数量 |
-| `--hours` | `-t` | float | 24 | 模拟时长（小时） |
-| `--backend` | `-b` | kepler \| skyfield | kepler | 轨道后端引擎 |
-| `--altitude` | `-a` | float | 500.0 | 轨道高度 (km) |
-| `--inclination` | `-i` | float | 90.0 | 轨道倾角 (°) |
-| `--distribution` | `-d` | walker \| cluster \| uniform | uniform | 星座分布策略 |
-| `--timeslot-duration` | – | float | 1.0 | 每时间槽分钟数 |
-| `--config` | `-c` | str | – | JSON 配置文件路径 |
-| `--output` | `-o` | str | – | 导出结果 JSON |
-| `--show-contacts` | – | flag | – | 显示通信记录摘要 |
-| `--generate-config` | – | str | – | 生成配置模板到指定文件 |
-| `--quiet` | `-q` | flag | – | 安静模式 |
-
-### 3.3 调参示例
+### 3.1 快速单次实验
 
 ```powershell
-# 基础模拟
-fl-space simulate
+# 1. 调参
+fls tune lr 0.001
+fls tune rounds 500
+fls tune dataset cifar10
 
-# 大规模星座 + 高精度后端
-fl-space simulate --sats 30 --stations 13 --hours 48 --backend skyfield
+# 2. 挂载算法
+fls mount algo fedprox
+fls mount isl wgs84
+fls mount isl-buffer 80
 
-# 低轨 Walker 星座
-fl-space simulate -n 20 -g 10 -a 550 -i 53 -d walker -t 24
+# 3. 查看当前配置
+fls run show
 
-# 导出结果 JSON
-fl-space simulate -n 10 -g 5 --output sim_result.json
+# 4. 运行训练
+fls run train --quiet --output result.json
 
-# 从 JSON 配置文件加载 + CLI 覆盖某些参数
-fl-space simulate --config my_config.json --hours 72 --quiet
+# 5. 运行完整模拟
+fls run simulate --sats 10 --hours 48
 ```
 
----
-
-## 4. train — FL 训练实验
-
-### 4.1 基本用法
+### 3.2 覆盖式运行（不改 session）
 
 ```powershell
-fl-space train [参数]
+# 不改session，仅本次运行覆盖参数
+fls run train --lr 0.1 --rounds 100 --device cuda --no-session
 ```
 
-### 4.2 完整参数表
-
-| 参数 | 简写 | 类型 | 默认值 | 说明 |
-|------|------|------|--------|------|
-| `--algo` | – | fedavg \| fedprox \| fedbuff | fedavg | FL 算法 |
-| `--dataset` | `-d` | mnist \| fashion_mnist \| cifar10 | mnist | 数据集 |
-| `--scale` | `-s` | small \| medium \| large | small | 实验规模 |
-| `--rounds` | `-r` | int | 规模决定 | 全局训练轮次 |
-| `--epochs` | `-e` | int | 5 | 本地训练 epoch 数 |
-| `--lr` | – | float | 0.01 | 学习率 |
-| `--batch-size` | – | int | 32 | batch size |
-| `--mu` | – | float | 0.01 | FedProx 近端项系数 μ |
-| `--buffer-size` | – | int | 5 | FedBuff 缓冲区大小 K |
-| `--staleness` | – | flag | – | FedBuff 陈旧度降权 |
-| `--device` | – | cpu \| cuda | cpu | 计算设备 |
-| `--seed` | – | int | – | 随机种子 |
-| `--non-iid` | – | flag | – | 使用 non-IID 数据分布 |
-| `--alpha` | – | float | 0.5 | Dirichlet α (non-IID) |
-| `--config` | `-c` | str | – | JSON 配置文件路径 |
-| `--output` | `-o` | str | – | 导出训练历史 JSON |
-| `--generate-config` | – | str | – | 生成配置模板到指定文件 |
-| `--quiet` | `-q` | flag | – | 安静模式 |
-
-### 4.3 规模预设对应关系
-
-| 规模 | 客户端数 | 默认轮次 | 适用场景 |
-|------|---------|---------|---------|
-| `small` | 5 | 30 | 快速验证 |
-| `medium` | 20 | 100 | 标准评测 |
-| `large` | 50 | 200 | 大规模仿真 |
-
-### 4.4 调参示例
+### 3.3 批量实验脚本
 
 ```powershell
 # 基准 FedAvg
-fl-space train --algo fedavg --dataset mnist --scale small
+fls mount algo fedavg
+fls tune lr 0.01
+fls run train --output fedavg_bench.json
 
-# FedProx + CIFAR-10 + GPU
-fl-space train --algo fedprox --dataset cifar10 --scale medium --mu 0.1 --device cuda
+# FedProx 对比
+fls mount algo fedprox
+fls tune mu 0.1
+fls run train --output fedprox_bench.json
 
-# FedBuff 异步 + non-IID 数据
-fl-space train --algo fedbuff --buffer-size 10 --non-iid --alpha 0.3
-
-# 自定义轮次和 epoch
-fl-space train --algo fedavg --rounds 200 --epochs 10 --lr 0.001
-
-# 从 JSON 配置文件加载 + CLI 覆盖
-fl-space train --config my_fl.json --device cuda --rounds 300
-
-# 导出训练历史
-fl-space train --algo fedprox -d cifar10 --output history.json
+# ISL 启用对比
+fls mount isl wgs84
+fls mount isl-buffer 80
+fls run simulate --output sim_with_isl.json
 ```
 
 ---
 
-## 5. list — 查看资源
+## 4. tune — 调参指令
 
-```powershell
-fl-space list <资源类型>
-```
+所有 tune 参数保存到 session，`run` 时自动消费。
 
-| 资源类型 | 说明 | 输出内容 |
-|---------|------|---------|
-| `presets` | FL 实验预设 | 6 个组合预设（算法 + 规模 + 数据集） |
-| `models` | 可用模型 | mlp / simplecnn |
-| `satellites` | 已注册卫星类型 | polar_6, starlink_20, mixed_10, demo |
-| `experiments` | 模拟实验预设 | C1~C6 六档规模配置 |
-
-```powershell
-fl-space list presets
-fl-space list satellites
-fl-space list experiments
-```
-
----
-
-## 6. export — 导出模拟结果
-
-```powershell
-fl-space export --output my_result.json [参数]
-```
-
-| 参数 | 简写 | 默认值 | 说明 |
+| 指令 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--output` | `-o` | (必填) | 输出 JSON 路径 |
-| `--body` | – | earth | 中心天体 (earth/mars/moon/jupiter/saturn/venus) |
-| `--sats` | `-n` | 10 | 卫星数量 |
-| `--stations` | `-g` | 5 | 地面站数量 |
-| `--hours` | `-t` | 24 | 模拟时长 |
-| `--altitude` | `-a` | 500.0 | 轨道高度 (km) |
-| `--inclination` | `-i` | 90.0 | 轨道倾角 (°) |
-| `--backend` | `-b` | kepler | 后端引擎 |
-| `--timeslot` | – | 1.0 | 时间槽分钟数 |
+| `fls tune lr` | float | 0.01 | 学习率 |
+| `fls tune rounds` | int | 300 | 训练轮次 |
+| `fls tune epochs` | int | 5 | 本地训练 epoch |
+| `fls tune batch` | int | 32 | batch size |
+| `fls tune mu` | float | 0.01 | FedProx 近端项系数 μ |
+| `fls tune buffer-size` | int | 5 | FedBuff 缓冲区大小 K |
+| `fls tune seed` | int | 42 | 随机种子 |
+| `fls tune dataset` | mnist / fashion_mnist / cifar10 | mnist | 数据集 |
+| `fls tune scale` | small / medium / large | small | 实验规模 |
+| `fls tune early-stop` | float | 0.90 | 早停准确率阈值 |
+| `fls tune workers` | int | 1 | 并行训练线程数 |
+| `fls tune data-workers` | int | 0 | DataLoader 进程数 |
+| `fls tune non-iid` | on / off | off | non-IID 数据分布 |
+| `fls tune alpha` | float | 0.5 | Dirichlet α (non-IID) |
+| `fls tune device` | cpu / cuda | cpu | 计算设备 |
+| `fls tune show` | — | — | 查看当前调参 |
+| `fls tune reset` | — | — | 重置为默认值 |
 
-**输出 JSON 包含**：配置参数、接触率、统计信息、每个卫星的完整通信记录。
+---
+
+## 5. mount — 挂载指令
+
+选择算法和功能模块，保存到 session。
+
+| 指令 | 可选值 | 默认值 | 说明 |
+|------|--------|--------|------|
+| `fls mount algo` | fedavg / fedprox / fedbuff | fedavg | FL 算法 |
+| `fls mount isl` | disabled / wgs84 | disabled | ISL 星间链路计算器 |
+| `fls mount isl-buffer` | float | 0.0 | ISL WGS84 大气余量 (km) |
+| `fls mount isl-step` | float | 60.0 | ISL 采样步长 (秒) |
+| `fls mount time-model` | slot / physics | slot | 虚拟时间模型 |
+| `fls mount time-model-args` | JSON 字符串 | null | 时间模型参数 |
+| `fls mount backend` | kepler / skyfield | kepler | 轨道计算后端 |
+| `fls mount body` | earth / mars / moon / jupiter / saturn / venus | earth | 中心天体 |
+| `fls mount distribution` | uniform / walker / cluster | uniform | 星座分布策略 |
+| `fls mount staleness` | on / off | off | FedBuff 陈旧度降权 |
+| `fls mount sats` | int | 5 | 卫星数量 |
+| `fls mount stations` | int | 3 | 地面站数量 |
+| `fls mount sim-hours` | float | 24.0 | 模拟时长 (小时) |
+| `fls mount timeslot-min` | float | 1.0 | 时隙粒度 (分钟) |
+| `fls mount altitude` | float | 500.0 | 轨道高度 (km) |
+| `fls mount inclination` | float | 53.0 | 轨道倾角 (°) |
+| `fls mount config` | JSON 文件路径 | — | 加载 JSON 配置 |
+| `fls mount show` | — | — | 查看当前挂载 |
+| `fls mount clear` | — | — | 重置为默认值 |
+
+---
+
+## 6. run — 运行指令
+
+### 6.1 run simulate — 轨道接触模拟
 
 ```powershell
-# 导出火星模拟
-fl-space export --body mars --sats 5 --output mars_sim.json
+fls run simulate [--覆盖参数]
+```
 
-# 导出大规模地球模拟
-fl-space export --body earth --sats 30 --stations 13 --hours 48 --output large_earth.json
+| 覆盖参数 | 说明 |
+|----------|------|
+| `--sats N` | 卫星数量 |
+| `--stations N` | 地面站数量 |
+| `--hours N` | 模拟时长 (h) |
+| `--backend kepler/skyfield` | 轨道后端 |
+| `--altitude N` | 轨道高度 (km) |
+| `--inclination N` | 轨道倾角 (°) |
+| `--distribution uniform/walker/cluster` | 分布策略 |
+| `--timeslot-min N` | 时隙粒度 (min) |
+| `--body earth/mars/...` | 中心天体 |
+| `--isl disabled/wgs84` | ISL 计算器 |
+| `--isl-buffer N` | ISL 大气余量 (km) |
+| `--output PATH` | 导出 JSON 路径 |
+| `--quiet` / `-q` | 安静模式 |
+| `--no-session` | 忽略 session 用默认值 |
+
+```powershell
+# 示例
+fls mount sats 20
+fls mount sim-hours 48
+fls run simulate --backend skyfield --output sim.json
+fls run simulate --sats 10 --hours 6 --quiet --no-session   # 纯默认值运行
+```
+
+### 6.2 run train — FL 训练实验
+
+```powershell
+fls run train [--覆盖参数]
+```
+
+| 覆盖参数 | 说明 |
+|----------|------|
+| `--rounds N` | 训练轮次 |
+| `--epochs N` | 本地 epoch |
+| `--lr N` | 学习率 |
+| `--batch-size N` | batch size |
+| `--mu N` | FedProx μ |
+| `--buffer-size N` | FedBuff K |
+| `--device cpu/cuda` | 计算设备 |
+| `--seed N` | 随机种子 |
+| `--time-model slot/physics` | 时间模型 |
+| `--time-model-args JSON` | 时间模型参数 |
+| `--output PATH` | 导出 JSON |
+| `--quiet` / `-q` | 安静模式 |
+| `--no-session` | 忽略 session |
+
+```powershell
+fls mount algo fedprox
+fls tune lr 0.001
+fls run train --output result.json
+```
+
+### 6.3 run experiment — 完整太空实验
+
+```powershell
+fls run experiment [--覆盖参数]
+```
+
+| 覆盖参数 | 说明 |
+|----------|------|
+| `--gs N1 N2 ...` | 地面站数量列表 (FedAvg 默认: 3 5 7 10) |
+| `--sats-list N1 N2 ...` | 卫星数量列表 (FedAvg 网格) |
+| `--sats-single N` | 卫星数 (FedProx 单组实验) |
+| `--output DIR` | 输出目录 |
+| `--quiet` / `-q` | 安静模式 |
+
+```powershell
+# FedAvg 网格搜索
+fls mount algo fedavg
+fls run experiment --gs 3 5 7 --sats-list 5 10 15
+
+# FedProx 异构轨道
+fls mount algo fedprox
+fls tune mu 0.1
+fls run experiment --gs 1 3 5 --sats-single 10 --output fedprox_results
+```
+
+### 6.4 run quick-test — FedProxSat 快速测试
+
+```powershell
+fls run quick-test [--覆盖参数]
+```
+
+| 覆盖参数 | 说明 |
+|----------|------|
+| `--mu N` | 基础 μ |
+| `--mu-min N` | 自适应 μ 下限 |
+| `--mu-max N` | 自适应 μ 上限 |
+| `--no-adaptive` | 禁用自适应 μ |
+| `--oscillation-threshold N` | 震荡阈值 |
+| `--stability-threshold N` | 稳定阈值 |
+| `--rounds N` | 轮次 |
+| `--gs N` | 地面站数 |
+| `--quiet` / `-q` | 安静模式 |
+
+```powershell
+fls run quick-test --mu 0.01 --gs 5
+```
+
+### 6.5 run list — 查看内置资源
+
+```powershell
+fls run list [presets|models|satellites|experiments]
+```
+
+### 6.6 run export — 导出模拟结果
+
+```powershell
+fls run export --output result.json [--覆盖参数]
+```
+
+参数同 `run simulate`。
+
+### 6.7 run serve — 3D 可视化
+
+```powershell
+fls run serve [--覆盖参数]
+```
+
+| 覆盖参数 | 说明 |
+|----------|------|
+| `--host` | 监听地址 (默认 0.0.0.0) |
+| `--port` | 端口 (默认 8700) |
+| `--serve-sats N` | 卫星数 |
+| `--serve-gs N` | 地面站数 |
+| `--serve-hours N` | 模拟时长 |
+| `--serve-isl disabled/wgs84` | ISL 启用 |
+
+```powershell
+fls mount isl wgs84
+fls mount isl-buffer 80
+fls run serve --serve-sats 10 --port 8080
 ```
 
 ---
 
-## 7. info — 系统环境
+## 7. Session 文件格式
 
-```powershell
-fl-space info
-```
-
-输出示例：
-```
-=== SpaceFL 环境信息 ===
-
-  框架版本: 0.1.0
-  Python:   3.13.7 (CPython)
-  操作系统: Windows 11
-  PyTorch:  [OK] 可用
-  Skyfield: [OK] 可用
-  NumPy:    [OK] 2.3.5
-  Matplotlib: [OK] 3.10.7
-  CUDA:     [--] 不可用 (CPU only)
-```
-
----
-
-## 8. 外接自定义配置
-
-### 8.1 三种配置方式
-
-| 方式 | 适用场景 | 示例 |
-|------|---------|------|
-| **CLI 参数** | 快速调参、单次实验 | `fl-space simulate --sats 20 --hours 48` |
-| **JSON 配置文件** | 固定配置、版本管理、团队共享 | `fl-space simulate --config my_sim.json` |
-| **Python API** | 复杂逻辑、自定义组件、研究开发 | 见 `CODING_STANDARDS.md` 和项目文档 |
-
-### 8.2 生成配置模板
-
-```powershell
-# 生成模拟器配置模板
-fl-space simulate --generate-config my_sim.json
-
-# 生成 FL 实验配置模板
-fl-space train --generate-config my_fl.json
-```
-
-### 8.3 配置文件优先级
-
-```
-CLI 显式参数  >  JSON 配置文件  >  内置默认值
-```
-
-即：JSON 文件提供基础配置，CLI 参数可以覆盖 JSON 中的任意字段。
-
-### 8.4 工作流示例
-
-```powershell
-# 1. 生成模板
-fl-space simulate --generate-config my_experiment.json
-
-# 2. 编辑 JSON 文件（修改卫星数、地面站、轨道参数等）
-
-# 3. 运行实验，CLI 覆盖部分参数
-fl-space simulate --config my_experiment.json --hours 72 --output result.json
-
-# 4. 分析结果
-python analyze.py result.json
-```
-
----
-
-## 9. JSON 配置文件参考
-
-### 9.1 模拟器配置文件 (simulate/export)
+`.fls_session.json`:
 
 ```json
 {
-  "_comment": "SpaceFL 模拟器配置",
-  "num_satellites": 10,
-  "num_ground_stations": 5,
-  "orbit_altitude_km": 500.0,
-  "orbit_inclination_deg": 90.0,
-  "distribution": "uniform",
-  "backend": "kepler",
-  "timeslot_duration_min": 1.0,
-  "num_timeslots": 1440,
-  "body": {
-    "name": "Earth",
-    "radius_km": 6371.0,
-    "GM": 398600.4418,
-    "rotation_period_hours": 24.0,
-    "atmosphere_height_km": 100.0
+  "tune": {
+    "lr": 0.01,
+    "rounds": 300,
+    "epochs": 5,
+    "batch_size": 32,
+    "mu": 0.01,
+    "seed": 42,
+    "dataset": "mnist",
+    "scale": "small",
+    "early_stop": 0.9,
+    "workers": 1,
+    "data_workers": 0,
+    "non_iid": false,
+    "alpha": 0.5,
+    "device": "cpu",
+    "buffer_size": 5
   },
-  "ground_stations": [
-    {"name": "Beijing", "lat_deg": 39.9, "lon_deg": 116.4, "altitude_km": 0.05},
-    {"name": "Sanya", "lat_deg": 18.25, "lon_deg": 109.5, "altitude_km": 0.0},
-    {"name": "Kashi", "lat_deg": 39.5, "lon_deg": 76.0, "altitude_km": 1.3}
-  ]
+  "mount": {
+    "algo": "fedavg",
+    "isl": "disabled",
+    "isl_buffer": 0.0,
+    "isl_step": 60.0,
+    "time_model": "slot",
+    "time_model_args": null,
+    "backend": "kepler",
+    "body": "earth",
+    "distribution": "uniform",
+    "staleness": false,
+    "sats": 5,
+    "stations": 3,
+    "sim_hours": 24.0,
+    "timeslot_min": 1.0,
+    "altitude": 500.0,
+    "inclination": 53.0,
+    "config": null
+  }
 }
 ```
 
-**字段说明：**
+---
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `num_satellites` | int | 否 | 卫星数量 (默认 5) |
-| `num_ground_stations` | int | 否 | 地面站数量 (默认 3) |
-| `orbit_altitude_km` | float | 否 | 轨道高度 km |
-| `orbit_inclination_deg` | float | 否 | 轨道倾角 ° |
-| `distribution` | str | 否 | walker / cluster / uniform |
-| `backend` | str | 否 | kepler / skyfield |
-| `timeslot_duration_min` | float | 否 | 每时间槽分钟数 |
-| `num_timeslots` | int | 否 | 时间槽总数 |
-| `body` | dict | 否 | 天体参数 (name/radius_km/GM/rotation_period_hours) |
-| `ground_stations` | list | 否 | 地面站列表 (name/lat_deg/lon_deg/altitude_km) |
+## 8. Tab 补全
 
-> 地面站也支持简写格式：`["Beijing", 39.9, 116.4]`
+### 8.1 argcomplete (推荐)
 
-### 9.2 FL 实验配置文件 (train)
+```powershell
+# 安装
+pip install argcomplete
 
-```json
-{
-  "_comment": "SpaceFL FL 实验配置",
-  "algorithm": "fedavg",
-  "num_rounds": 50,
-  "num_clients": 10,
-  "fraction": 0.5,
-  "local_epochs": 5,
-  "batch_size": 32,
-  "learning_rate": 0.01,
-  "mu": 0.01,
-  "buffer_size": 5,
-  "staleness_weight": false,
-  "device": "cpu",
-  "seed": 42
+# 激活 (PowerShell)
+Register-ArgumentCompleter -Command fls -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    & python -m fl_space.cli _complete $commandAst
 }
 ```
 
-**字段说明：**
+### 8.2 内置 PowerShell 脚本
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `algorithm` | str | ✅ | fedavg / fedprox / fedbuff |
-| `num_rounds` | int | 否 | 全局训练轮次 (默认 50) |
-| `num_clients` | int | 否 | 客户端总数 (默认 10) |
-| `fraction` | float | 否 | 每轮参与客户端比例 (默认 0.5) |
-| `local_epochs` | int | 否 | 本地训练 epoch (默认 5) |
-| `batch_size` | int | 否 | 训练 batch size (默认 32) |
-| `learning_rate` | float | 否 | 学习率 (默认 0.01) |
-| `mu` | float | 否 | FedProx 近端项系数 (默认 0.01) |
-| `buffer_size` | int | 否 | FedBuff 缓冲区大小 (默认 5) |
-| `staleness_weight` | bool | 否 | FedBuff 陈旧度降权 (默认 false) |
-| `device` | str | 否 | cpu / cuda (默认 cpu) |
-| `seed` | int | 否 | 随机种子 |
+```powershell
+fls completion ps1 > fls_completion.ps1
+. .\fls_completion.ps1
+```
 
-### 9.3 通过 Python API 接入自定义逻辑
+---
 
-对于超出 JSON 配置能力的场景（如自定义 FL 组件、自定义模型），使用 Python API：
+## 9. Python API 接入
 
 ```python
-# ── 接入自定义 FL 组件 ──
-from fl_space.fl.core import LocalTrainer, ClientUpdate
-from fl_space.fl.server import FLServer, FLConfig
-from fl_space.fl.runner import FLRunner
+from fl_space.cli import load_session, save_session, cmd_run_simulate
 
-class MyCustomTrainer(LocalTrainer):
-    """自定义本地训练逻辑。"""
-    def train(self, client_id, model, train_loader, global_weights, round_num, **kwargs):
-        # 你的训练逻辑
-        ...
-        return ClientUpdate(...)
-
-# 使用自定义组件
-config = FLConfig(algorithm="fedavg", num_rounds=100)
-runner = FLRunner(config, MyRandomSelector(), MyCustomTrainer(), ...)
-history = runner.run()
-
-# ── 接入自定义模型 ──
-from fl_space.fl.models import register_model, get_model
-import torch.nn as nn
-
-class MyResNet(nn.Module):
-    ...
-
-register_model("my_resnet", MyResNet)
-model = get_model("my_resnet", num_classes=100)
-
-# ── 自定义地面站网络 ──
-from fl_space.environment import GroundStation, GroundStationNetwork
-
-stations = GroundStationNetwork([
-    GroundStation(name="MySite", lat_deg=30.0, lon_deg=120.0),
-    GroundStation(name="MySite2", lat_deg=-30.0, lon_deg=-60.0),
-])
-
-from fl_space.simulator import OrbitSimulator
-sim = OrbitSimulator(
-    ground_station_network=stations,
-    num_satellites=10,
-    ...
-)
+# 编程方式读写 session
+s = load_session()
+s["tune"]["lr"] = 0.001
+s["mount"]["algo"] = "fedprox"
+save_session(s)
 ```
 
 ---
 
 ## 附录：常见问题
 
-**Q: 如何分享实验配置给他人？**
+**Q: 如何分享实验配置？**
 ```powershell
-# 生成配置文件
-fl-space train --generate-config shared_experiment.json
-# 编辑后提交到 git，他人可直接使用
-fl-space train --config shared_experiment.json
+fls run show                    # 查看当前配置
+# 复制 .fls_session.json 给他人
+fls mount config partner.json  # 对方加载
 ```
 
-**Q: 配置文件中某些字段不填会怎样？**
-使用内置默认值。只填需要覆盖的字段即可。
-
-**Q: 如何同时看到 JSON 配置和 CLI 覆盖的效果？**
-运行时会在输出中标注 `[配置] 加载 xxx.json`，打印的参数是最终生效的值。
-
 **Q: 如何批量运行多组实验？**
-Windows 下可使用批处理脚本：
-```batch
-fl-space simulate --config base.json --sats 10 --output exp1.json
-fl-space simulate --config base.json --sats 20 --output exp2.json
-fl-space simulate --config base.json --sats 30 --output exp3.json
+```powershell
+for mu in 0.001 0.01 0.1; do
+    fls tune mu $mu
+    fls run train --output "mu_${mu}.json"
+done
+```
+
+**Q: 如何只覆盖一次参数？**
+```powershell
+fls run train --lr 0.1 --no-session  # session 不会被修改
 ```

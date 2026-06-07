@@ -26,3 +26,6 @@ Thumbs.db
 
 # Results
 results/
+
+# Session
+.fls_session.json

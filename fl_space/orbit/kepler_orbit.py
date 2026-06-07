@@ -145,7 +145,7 @@ class KeplerOrbit:
 
         # 轨道周期 (分钟)
         self._period_min = (
-            2 * math.pi * math.sqrt(elements.semi_major_axis_km ** 3 / body.GM)
+            2 * math.pi * math.sqrt(elements.semi_major_axis_km**3 / body.GM)
         ) / 60.0
 
         # 平均运动 (rad/min)
@@ -223,7 +223,7 @@ class KeplerOrbit:
                 break
 
         # 偏近点角 → 真近点角
-        sin_nu = math.sqrt(1 - e ** 2) * math.sin(E) / (1 - e * math.cos(E))
+        sin_nu = math.sqrt(1 - e**2) * math.sin(E) / (1 - e * math.cos(E))
         cos_nu = (math.cos(E) - e) / (1 - e * math.cos(E))
         nu = math.atan2(sin_nu, cos_nu)
         return nu % (2 * math.pi)
@@ -234,15 +234,13 @@ class KeplerOrbit:
         cos_nu = math.cos(true_anomaly_rad)
         # 偏近点角
         cos_E = (e + cos_nu) / (1 + e * cos_nu)
-        sin_E = math.sqrt(1 - e ** 2) * math.sin(true_anomaly_rad) / (1 + e * cos_nu)
+        sin_E = math.sqrt(1 - e**2) * math.sin(true_anomaly_rad) / (1 + e * cos_nu)
         E = math.atan2(sin_E, cos_E)
         # 开普勒方程
         M = E - e * math.sin(E)
         return M % (2 * math.pi)
 
-    def position_at_time(
-        self, time_min: float
-    ) -> tuple[float, float]:
+    def position_at_time(self, time_min: float) -> tuple[float, float]:
         """
         计算 t 时刻卫星的星下点位置 (纬度, 经度)。
 
@@ -268,9 +266,7 @@ class KeplerOrbit:
         u = self.elements.arg_perigee_rad + nu
 
         # 纬度: sin(δ) = sin(i)·sin(u)
-        sat_lat_rad = math.asin(
-            math.sin(self.elements.inclination_rad) * math.sin(u)
-        )
+        sat_lat_rad = math.asin(math.sin(self.elements.inclination_rad) * math.sin(u))
 
         # 经度 (轨道平面内): λ' = Ω + arctan(cos(i)·tan(u))
         # 处理 tan(u) 的奇点
@@ -278,14 +274,10 @@ class KeplerOrbit:
         if abs(math.cos(u)) < 1e-12:
             lon_in_plane = self.elements.raan_rad + (math.pi / 2) * math.copysign(1, math.sin(u))
         else:
-            lon_in_plane = self.elements.raan_rad + math.atan2(
-                cos_i * math.sin(u), math.cos(u)
-            )
+            lon_in_plane = self.elements.raan_rad + math.atan2(cos_i * math.sin(u), math.cos(u))
 
         # 减去地球自转
-        rotation_offset = math.radians(
-            time_min * (360.0 / (self.body.rotation_period_hours * 60))
-        )
+        rotation_offset = math.radians(time_min * (360.0 / (self.body.rotation_period_hours * 60)))
         sat_lon_rad = lon_in_plane - rotation_offset
 
         # 归一化经度
@@ -293,9 +285,7 @@ class KeplerOrbit:
 
         return sat_lat_rad, sat_lon_rad
 
-    def position_at_time_deg(
-        self, time_min: float
-    ) -> tuple[float, float]:
+    def position_at_time_deg(self, time_min: float) -> tuple[float, float]:
         """
         计算 t 时刻卫星的星下点位置 (纬度°, 经度°)。
 
@@ -311,6 +301,30 @@ class KeplerOrbit:
         lat_rad, lon_rad = self.position_at_time(time_min)
         return math.degrees(lat_rad), math.degrees(lon_rad)
 
+    def ecef_at_time(self, time_min: float) -> tuple[float, float, float]:
+        """计算 t 时刻卫星的 ECEF 坐标 (km)。
+
+        基于开普勒轨道的星下点纬度/经度 + 轨道半径转换到 ECEF。
+        用于 ISL 星间链路计算。
+
+        Parameters
+        ----------
+        time_min : float
+            从 t=0 起的时间 (分钟)。
+
+        Returns
+        -------
+        (x_km, y_km, z_km) : Tuple[float, float, float]
+            ECEF 坐标 (km)。
+        """
+        lat_rad, lon_rad = self.position_at_time(time_min)
+        r = self._orbit_radius_km
+        cos_lat = math.cos(lat_rad)
+        x = r * cos_lat * math.cos(lon_rad)
+        y = r * cos_lat * math.sin(lon_rad)
+        z = r * math.sin(lat_rad)
+        return (x, y, z)
+
     def __repr__(self) -> str:
         return (
             f"KeplerOrbit(a={self._orbit_radius_km:.0f}km, "
@@ -321,6 +335,7 @@ class KeplerOrbit:
 
 
 # ---- 工厂函数 ----
+
 
 def create_circular_orbit(
     altitude_km: float,
@@ -389,6 +404,7 @@ def create_polar_orbit(
     """
     if body is None:
         from fl_space.environment import CelestialBody
+
         body = CelestialBody.earth()
 
     raan = satellite_id * (360.0 / num_satellites)

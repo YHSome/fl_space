@@ -95,6 +95,58 @@
 - 特别包含 AI 辅助开发准则（第10章），涵盖提示词模板、AI代码检查流程、严禁事项
 - 附录提供常见模式速查和常见错误示例
 
+## 师兄项目优势整合 (2026-06-06) — ISL + Flower + Pydantic + CesiumJS
+
+### ISL 星间链路模块 (`fl_space/isl/`)
+- **`los.py`**: WGS84椭球遮挡判定（从 autoFly_Stk earth_los.py 移植），纯数学计算零依赖
+- **`base.py`**: ISLCalculator(ABC) + ISLConfig + ISLWindow + NoISLCalculator + 工厂函数 create_isl_calculator()
+- **`intra_cluster.py`**: 簇内 LOS 窗口计算（从 autoFly_Stk intra_cluster.py 改写），适配 KeplerOrbit ECEF
+- 支持用户自定义 ISL 计算器：`--isl path/to/custom.py:ClassName`
+
+### 集成到 SpaceFL 核心
+- `KeplerOrbit.ecef_at_time()`: 新增 ECEF 坐标方法
+- `OrbitSimulator`: 新增 isl_config、compute_isl()、isl_windows、isl_stats、isl_active_at()、isl_peers_at()
+- `OrbitSimulator`: 新增 get_sat_ecef()、get_all_ecef_at_timeslot()
+- `FLConfig`: 新增 isl_enabled/isl_calculator/isl_atmosphere_buffer_km/isl_step_seconds
+- CLI: `fls experiment --isl wgs84 --isl-buffer 80`
+- `standard_experiment.py`: 支持 isl_enabled 等参数
+
+### Flower 框架集成 (`fl_space/integrations/flower/`)
+- **`adapter.py`**: FlowerAdapter — 从 SpaceFL OrbitSimulator 构造，提供 AccessSchedule 兼容 API
+- 不重算轨道/不依赖 CSV — 直接消费 ContactMatrix + ISL Windows
+- 支持 clients_visible_at / stations_visible_for / next_contact / intra_peers_at 等查询
+
+### Pydantic 强类型配置 (`fl_space/config/`)
+- **`schemas.py`**: SpaceFLScenario + WalkerSpec + GroundStation + IntraClusterSpec + FLExperimentSpec（可选依赖 pydantic）
+- **`yaml_loader.py`**: YAML 配置加载器，纯 PyYAML 实现（无需 pydantic），输出 sim_kwargs + fl_config 字典
+
+### CesiumJS 3D 可视化 (`web/`)
+- **`index.html`**: CesiumJS 3D 地球 + 卫星轨迹/GS-SAT链路/ISL链路实时渲染
+- **`server.py`**: FastAPI 服务器，从 OrbitSimulator 生成前端 JSON 数据
+- CLI: `fls serve --sats 10 --gs 5 --isl wgs84`
+
+### 模块化可替换设计
+- ISL: `--isl disabled|wgs84|path/to/custom.py:ClassName`
+- Flower: `FlowerAdapter.from_simulator(sim)` 可选消费
+- Pydantic: `from fl_space.config.schemas import ...` 可选导入
+- CesiumJS: `fls serve` 独立子命令
+- **向后兼容**: 所有新功能默认关闭，不影响现有实验
+
+### Ruff 零告警 + 烟雾测试通过
+- 所有新文件 ruff check + ruff format 通过
+- 烟雾测试验证：ISL WGS84 遮挡正确、ECEF 计算准确、FL 实验兼容性完好
+
+## CLI 三层架构重构 (2026-06-06)
+- **tune** 调参指令：lr/rounds/epochs/batch/mu/seed/dataset/scale/early-stop/workers/non-iid/alpha/device/buffer-size
+- **mount** 挂载指令：algo/isl/isl-buffer/isl-step/time-model/time-model-args/backend/body/distribution/staleness/sats/stations/sim-hours/timeslot-min/altitude/inclination/config
+- **run** 运行指令：simulate/train/experiment/quick-test/list/export/serve/show
+- **Session 持久化**：tune/mount 修改保存到 `.fls_session.json`，run 消费当前 session
+- **参数优先级**：CLI --覆盖 > session 值 > 默认值
+- **`--` 替换为空格**：tune/mount 使用纯空格分隔（如 `fls tune lr 0.001`），run 保留 `--` 覆盖
+- Tab 补全：argcomplete 集成 + 内置 PowerShell 脚本（`fls completion install/ps1`）
+- 自定义 help 输出：分类彩色布局，`fls help` 或 `fls -h`
+- 完全向后兼容：原有 `_cmd_simulate` 等函数保留逻辑，新架构复用
+
 ## AI 修改代码强制性规范 (2026-06-05)
 - **每次修改代码后，Agent 必须自动运行 ruff 检查并修复**：
   1. 修改代码完成后，立即运行 `ruff check --fix <修改的文件>` 

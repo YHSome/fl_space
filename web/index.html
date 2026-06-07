@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpaceFL — 太空联邦学习 3D 可视化</title>
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.120/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.120/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', sans-serif; background: #0a0a1a; color: #e0e0e0; overflow: hidden; }
+  #cesiumContainer { width: 100vw; height: 100vh; position: absolute; top: 0; left: 0; z-index: 0; }
+  #panel {
+    position: absolute; top: 10px; right: 10px; z-index: 10;
+    background: rgba(10, 10, 30, 0.85); padding: 16px; border-radius: 8px;
+    border: 1px solid rgba(100, 200, 255, 0.3); min-width: 260px;
+    backdrop-filter: blur(8px); font-size: 13px;
+  }
+  #panel h2 { color: #64c8ff; font-size: 16px; margin-bottom: 12px; }
+  #panel .row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+  #panel .val { color: #4caf50; font-weight: bold; }
+  #panel .isl-on { color: #4caf50; } #panel .isl-off { color: #888; }
+  input, button, select {
+    background: rgba(20, 20, 50, 0.9); color: #e0e0e0; border: 1px solid rgba(100, 200, 255, 0.4);
+    padding: 6px 10px; border-radius: 4px; font-size: 12px; width: 100%; box-sizing: border-box;
+  }
+  button { cursor: pointer; margin-top: 8px; background: rgba(30, 100, 180, 0.7); }
+  button:hover { background: rgba(40, 130, 220, 0.8); }
+  #log { max-height: 120px; overflow-y: auto; font-size: 11px; color: #aaa; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div id="cesiumContainer"></div>
+<div id="panel">
+  <h2>🚀 SpaceFL LEO 3D</h2>
+  <div class="row"><span>时隙:</span><span class="val" id="ts">0</span></div>
+  <div class="row"><span>ISL:</span><span class="val isl-off" id="isl-st">禁用</span></div>
+  <div class="row"><span>卫星:</span><span class="val" id="sat-n">0</span></div>
+  <div class="row"><span>GS:</span><span class="val" id="gs-n">0</span></div>
+  <div class="row"><span>活跃链路:</span><span class="val" id="link-n">0</span></div>
+  <hr style="border-color:rgba(100,200,255,0.1);margin:10px 0;">
+  <input type="range" id="slider" min="0" max="100" value="0" step="1">
+  <div style="display:flex;gap:6px;margin-top:6px;">
+    <button id="btn-play" style="flex:1;">▶ 播放</button>
+    <button id="btn-pause" style="flex:1;">⏸ 暂停</button>
+    <button id="btn-load" style="flex:1;">📡 加载</button>
+  </div>
+  <input id="api-url" value="http://127.0.0.1:8700" placeholder="API 地址" style="margin-top:8px;font-size:11px;">
+  <div id="log"></div>
+</div>
+<script>
+// ── Init ──
+Cesium.Ion.defaultAccessToken = '';
+const viewer = new Cesium.Viewer('cesiumContainer', {
+  animation: false, timeline: false, baseLayerPicker: false,
+  fullscreenButton: false, geocoder: false, homeButton: false,
+  sceneModePicker: false, navigationHelpButton: false,
+  imageryProvider: Cesium.TileMapServiceImageryProvider.fromUrl(
+    Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII')
+  ),
+});
+viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#0a0a2a');
+viewer.scene.backgroundColor = Cesium.Color.BLACK;
+
+const satEntities = new Map();
+const gsEntities = new Map();
+const linkEntities = [];
+let frameData = null;
+let currentTs = 0;
+let maxTs = 100;
+let playing = false;
+let playTimer = null;
+
+function log(msg) {
+  const el = document.getElementById('log');
+  el.innerHTML += msg + '<br>';
+  el.scrollTop = el.scrollHeight;
+}
+
+// ── Load API data ──
+async function loadData() {
+  const base = document.getElementById('api-url').value;
+  log('加载轨道数据...');
+  const resp = await fetch(base + '/api/orbit_data');
+  frameData = await resp.json();
+  maxTs = frameData.timeslots.length - 1;
+  document.getElementById('slider').max = maxTs;
+  document.getElementById('sat-n').textContent = frameData.satellites;
+  document.getElementById('gs-n').textContent = frameData.ground_stations.length;
+
+  // Draw ground stations
+  for (const gs of frameData.ground_stations) {
+    viewer.entities.add({
+      position: Cesium.Cartesian3.fromDegrees(gs.lon, gs.lat, 0),
+      point: { pixelSize: 10, color: Cesium.Color.LIME,
+               outlineColor: Cesium.Color.BLACK, outlineWidth: 1 },
+      label: { text: gs.name, font: '11px sans-serif', fillColor: Cesium.Color.LIME,
+               showBackground: true, backgroundColor: new Cesium.Color(0,0,0,0.5),
+               pixelOffset: new Cesium.Cartesian2(8,-8) },
+    });
+  }
+
+  // Draw satellite trajectory lines
+  for (let s = 0; s < frameData.satellites; s++) {
+    const positions = [];
+    for (let t = 0; t <= maxTs; t++) {
+      const d = frameData.timeslots[t].positions[s];
+      positions.push(d.lon, d.lat, d.alt_km * 1000);
+    }
+    viewer.entities.add({
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArrayHeights(positions),
+        width: 1, material: Cesium.Color.fromHsl(s / frameData.satellites, 0.8, 0.5, 0.5),
+      }
+    });
+  }
+
+  document.getElementById('slider').value = 0;
+  updateFrame(0);
+  log(`加载完成: ${frameData.satellites} 卫星, ${maxTs+1} 时隙`);
+}
+
+function updateFrame(ts) {
+  if (!frameData) return;
+  currentTs = ts;
+  document.getElementById('ts').textContent = ts;
+  document.getElementById('slider').value = ts;
+
+  const slot = frameData.timeslots[ts];
+  if (!slot) return;
+
+  // Update satellites
+  for (let s = 0; s < frameData.satellites; s++) {
+    const p = slot.positions[s];
+    const name = 'SAT-' + String(s).padStart(2, '0');
+    let ent = satEntities.get(name);
+    if (!ent) {
+      ent = viewer.entities.add({
+        name: name,
+        position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt_km * 1000),
+        point: { pixelSize: 6, color: Cesium.Color.CYAN,
+                 outlineColor: Cesium.Color.BLACK, outlineWidth: 1 },
+        label: { text: name, font: '10px sans-serif', pixelOffset: new Cesium.Cartesian2(0,-8),
+                 fillColor: Cesium.Color.WHITE, showBackground: true,
+                 backgroundColor: new Cesium.Color(0,0,0,0.6) },
+      });
+      satEntities.set(name, ent);
+    } else {
+      ent.position = Cesium.Cartesian3.fromDegrees(p.lon, p.lat, p.alt_km * 1000);
+    }
+  }
+
+  // Remove old links
+  for (const ent of linkEntities) viewer.entities.remove(ent);
+  linkEntities.length = 0;
+
+  // Draw GS-SAT links
+  for (const link of slot.contacts || []) {
+    const gs = frameData.ground_stations[link.gs_id];
+    const sat = slot.positions[link.sat_id];
+    const ent = viewer.entities.add({
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArrayHeights([
+          gs.lon, gs.lat, 0, sat.lon, sat.lat, sat.alt_km * 1000
+        ]),
+        width: 2, material: Cesium.Color.fromCssColorString('#4caf5066'),
+      }
+    });
+    linkEntities.push(ent);
+  }
+
+  // Draw ISL links
+  for (const link of slot.isl_links || []) {
+    const a = slot.positions[link.a_id];
+    const b = slot.positions[link.b_id];
+    const ent = viewer.entities.add({
+      polyline: {
+        positions: Cesium.Cartesian3.fromDegreesArrayHeights([
+          a.lon, a.lat, a.alt_km * 1000, b.lon, b.lat, b.alt_km * 1000
+        ]),
+        width: 1.5, material: Cesium.Color.fromCssColorString('#ff980066'),
+      }
+    });
+    linkEntities.push(ent);
+  }
+
+  document.getElementById('link-n').textContent =
+    (slot.contacts?.length || 0) + (slot.isl_links?.length || 0);
+  document.getElementById('isl-st').textContent =
+    (slot.isl_links?.length > 0) ? '活跃' : '无';
+  document.getElementById('isl-st').className =
+    (slot.isl_links?.length > 0) ? 'val isl-on' : 'val isl-off';
+}
+
+// ── Controls ──
+document.getElementById('slider').addEventListener('input', e => {
+  updateFrame(parseInt(e.target.value));
+});
+
+document.getElementById('btn-play').addEventListener('click', () => {
+  playing = true;
+  function step() {
+    if (!playing) return;
+    let ts = currentTs + 1;
+    if (ts > maxTs) ts = 0;
+    updateFrame(ts);
+    playTimer = setTimeout(step, 200);
+  }
+  step();
+});
+
+document.getElementById('btn-pause').addEventListener('click', () => {
+  playing = false;
+  if (playTimer) clearTimeout(playTimer);
+});
+
+document.getElementById('btn-load').addEventListener('click', loadData);
+</script>
+</body>
+</html>

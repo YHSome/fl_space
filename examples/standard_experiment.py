@@ -154,6 +154,15 @@ def run_single_experiment(
     num_train_workers: int = 1,
     num_workers: int = 0,
     verbose: bool = True,
+    # ISL
+    isl_enabled: bool = False,
+    isl_calculator: str = "wgs84",
+    isl_atmosphere_buffer_km: float = 0.0,
+    isl_step_seconds: float = 60.0,
+    # 数据划分
+    non_iid: bool = True,
+    classes_per_client: int = 2,
+    max_samples_per_client: int = 1000,
 ) -> SingleExperiment:
     """运行单组 SpaceFL 实验。"""
     t0 = _time.time()
@@ -170,6 +179,16 @@ def run_single_experiment(
     num_timeslots = int(sim_hours * 60 / timeslot_duration_min)
 
     # 模拟器
+    from fl_space.isl.base import ISLConfig
+
+    isl_cfg = ISLConfig(
+        enabled=isl_enabled,
+        calculator=isl_calculator,
+        atmosphere_buffer_km=isl_atmosphere_buffer_km,
+        step_seconds=isl_step_seconds,
+        cluster_mode="plane",
+    )
+
     sim = OrbitSimulator(
         body=body,
         orbits=orbits,
@@ -178,6 +197,7 @@ def run_single_experiment(
         timeslot_duration_min=timeslot_duration_min,
         backend="kepler",
         contact_mode="simple",
+        isl_config=isl_cfg,
         verbose=False,
     )
 
@@ -222,8 +242,10 @@ def run_single_experiment(
 
     history = runner.run(
         dataset_name=dataset,
-        iid=False,
-        classes_per_client=2,
+        iid=not non_iid,
+        alpha=0.5,
+        classes_per_client=classes_per_client,
+        max_samples_per_client=max_samples_per_client,
         verbose=verbose,
     )
 
@@ -314,7 +336,7 @@ def _compute_contact_stats(sim: OrbitSimulator) -> dict:
                 )
 
         durations = [c["duration_slots"] for c in gs_contacts]
-        contacted_sats = sorted(set(c["sat_id"] for c in gs_contacts))
+        contacted_sats = sorted({c["sat_id"] for c in gs_contacts})
         per_gs[gs_id] = {
             "gs_name": gs_network.names[gs_id] if gs_id < len(gs_network.names) else f"GS-{gs_id}",
             "lat": float(gs_network[gs_id].lat_deg),
@@ -335,7 +357,7 @@ def _compute_contact_stats(sim: OrbitSimulator) -> dict:
     for sat_id in range(n_sats):
         row = mat[sat_id]
         contact_slots = int(np.sum(row >= 0))
-        contacted_gs = sorted(set(int(row[ts]) for ts in range(n_slots) if row[ts] >= 0))
+        contacted_gs = sorted({int(row[ts]) for ts in range(n_slots) if row[ts] >= 0})
         in_contact = row >= 0
         padded = np.concatenate([[False], in_contact, [False]])
         changes = np.diff(padded.astype(int))
@@ -519,7 +541,7 @@ def _plot_gs_positions(exp: SingleExperiment, path: str) -> None:
             xytext=(10, 10),
             fontsize=8,
             fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85),
+            bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85},
         )
 
     ax.set_xlim(-180, 180)
@@ -544,7 +566,7 @@ def _plot_gs_positions(exp: SingleExperiment, path: str) -> None:
         fontsize=7,
         family="monospace",
         verticalalignment="bottom",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
     )
 
     plt.tight_layout()
@@ -597,7 +619,7 @@ def _plot_contact_heatmap_std(exp: SingleExperiment, path: str) -> None:
         fontsize=7,
         family="monospace",
         verticalalignment="center",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.7},
     )
 
     plt.tight_layout()
@@ -730,7 +752,7 @@ def _plot_orbit_cross_section(exp: SingleExperiment, path: str) -> None:
         fontsize=7,
         family="monospace",
         verticalalignment="bottom",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
     )
 
     # 标注信息
@@ -742,7 +764,7 @@ def _plot_orbit_cross_section(exp: SingleExperiment, path: str) -> None:
         fontsize=9,
         ha="right",
         va="top",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.85),
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
     )
 
     limit = orbit_radius * 1.3
@@ -858,6 +880,15 @@ def run_experiment_grid(
     num_workers: int = 0,
     output_dir: str = "experiment_output",
     verbose: bool = True,
+    # ISL 星间链路
+    isl_enabled: bool = False,
+    isl_calculator: str = "wgs84",
+    isl_atmosphere_buffer_km: float = 0.0,
+    isl_step_seconds: float = 60.0,
+    # 数据划分
+    non_iid: bool = True,
+    classes_per_client: int = 2,
+    max_samples_per_client: int = 1000,
 ) -> list[SingleExperiment]:
     """运行完整的网格搜索实验套件。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -905,6 +936,13 @@ def run_experiment_grid(
                 num_train_workers=num_train_workers,
                 num_workers=num_workers,
                 verbose=verbose,
+                isl_enabled=isl_enabled,
+                isl_calculator=isl_calculator,
+                isl_atmosphere_buffer_km=isl_atmosphere_buffer_km,
+                isl_step_seconds=isl_step_seconds,
+                non_iid=non_iid,
+                classes_per_client=classes_per_client,
+                max_samples_per_client=max_samples_per_client,
             )
 
             exp_dir = os.path.join(output_dir, f"gs{gs}_sat{sat}")
@@ -960,8 +998,8 @@ def _generate_grid_summary(
 
 def _plot_grid_heatmap(results: list[SingleExperiment], output_dir: str) -> None:
     """绘制网格搜索准确率热力图。"""
-    gs_values = sorted(set(r.gs_count for r in results))
-    sat_values = sorted(set(r.sat_count for r in results))
+    gs_values = sorted({r.gs_count for r in results})
+    sat_values = sorted({r.sat_count for r in results})
 
     acc_matrix = np.zeros((len(gs_values), len(sat_values)))
     rounds_matrix = np.zeros((len(gs_values), len(sat_values)), dtype=int)
@@ -1080,7 +1118,7 @@ def main(argv: list[str] | None = None) -> int:
 
     t_start = _time.time()
 
-    results = run_experiment_grid(
+    run_experiment_grid(
         gs_counts=args.gs,
         sat_counts=args.sats,
         num_rounds=args.rounds,

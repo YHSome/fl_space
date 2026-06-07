@@ -43,6 +43,8 @@ def fedavg_config(**overrides: Any) -> FLConfig:
         "local_epochs": 5,
         "batch_size": 32,
         "learning_rate": 0.01,
+        "classes_per_client": 2,
+        "max_samples_per_client": 1000,
     }
     defaults.update(overrides)
     return FLConfig(**defaults)
@@ -72,6 +74,8 @@ def fedprox_config(**overrides: Any) -> FLConfig:
         "batch_size": 32,
         "learning_rate": 0.01,
         "mu": 0.01,
+        "classes_per_client": 2,
+        "max_samples_per_client": 1000,
     }
     defaults.update(overrides)
     return FLConfig(**defaults)
@@ -102,6 +106,8 @@ def fedbuff_config(**overrides: Any) -> FLConfig:
         "learning_rate": 0.01,
         "buffer_size": 5,
         "staleness_weight": False,
+        "classes_per_client": 2,
+        "max_samples_per_client": 1000,
     }
     defaults.update(overrides)
     return FLConfig(**defaults)

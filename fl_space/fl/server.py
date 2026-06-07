@@ -34,6 +34,7 @@ from fl_space.fl.time_model import TimeBreakdown, TimeModel
 # PyTorch 可选依赖
 try:
     import torch
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -73,6 +74,7 @@ class FLConfig:
     seed : int | None
         随机种子。
     """
+
     algorithm: str = "fedavg"
     num_rounds: int = 50
     num_clients: int = 10
@@ -90,10 +92,18 @@ class FLConfig:
     time_model: str = "slot"
     time_model_kwargs: dict = field(default_factory=dict)
     # 性能优化
-    num_workers: int = 0       # DataLoader 并行进程数
-    num_train_workers: int = 1 # 客户端并行训练线程数（1=串行）
+    num_workers: int = 0  # DataLoader 并行进程数
+    num_train_workers: int = 1  # 客户端并行训练线程数（1=串行）
     # 早停
     early_stop_acc: float | None = None  # 准确率阈值，达到后自动停止（如 0.9）
+    # ISL 星间链路（可插拔）
+    isl_enabled: bool = False  # 是否启用 ISL
+    isl_calculator: str = "wgs84"  # ISL 计算器: wgs84 | disabled | path/to/custom.py:Cls
+    isl_atmosphere_buffer_km: float = 0.0  # WGS84 大气余量 (km)
+    isl_step_seconds: float = 60.0  # ISL 采样步长 (秒)
+    # 数据划分（模拟太空 FL 小样本 non-IID）
+    classes_per_client: int = 2  # 每个客户端限定的类别数（滑动窗口分配），0 表示使用 Dirichlet
+    max_samples_per_client: int = 1000  # 每个客户端样本数上限，0 表示不限制
 
     @classmethod
     def from_dict(cls, config: dict) -> FLConfig:
@@ -145,6 +155,7 @@ class FLConfig:
             config = FLConfig.from_json("my_experiment.json")
         """
         import json
+
         with open(filepath, encoding="utf-8") as f:
             data = json.load(f)
         return cls.from_dict(data)
@@ -159,6 +170,7 @@ class FLConfig:
             当前配置的字典表示。
         """
         from dataclasses import asdict
+
         return asdict(self)
 
     def to_json(self, filepath: str) -> None:
@@ -171,6 +183,7 @@ class FLConfig:
             输出 JSON 文件路径。
         """
         import json
+
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, ensure_ascii=False, indent=2)
 
@@ -251,9 +264,7 @@ class FLServer:
         # 自动继承 timeslot 时长
         sim = self.scheduler._sim if self.scheduler is not None else None
         if sim is not None and "timeslot_duration_min" not in kwargs:
-            kwargs["timeslot_duration_min"] = getattr(
-                sim, "timeslot_duration_min", 1.0
-            )
+            kwargs["timeslot_duration_min"] = getattr(sim, "timeslot_duration_min", 1.0)
 
         return TimeModel.create(self.config.time_model, **kwargs)
 
@@ -294,8 +305,7 @@ class FLServer:
     def _init_clients(self) -> None:
         """初始化客户端状态列表。"""
         self._clients = [
-            ClientState(client_id=i, data_size=100)
-            for i in range(self.config.num_clients)
+            ClientState(client_id=i, data_size=100) for i in range(self.config.num_clients)
         ]
 
     def _update_connectivity(self, timeslot: int) -> None:
@@ -348,10 +358,7 @@ class FLServer:
 
         try:
             if global_weights is None:
-                global_weights = [
-                    param.data.clone()
-                    for param in self._global_model.parameters()
-                ]
+                global_weights = [param.data.clone() for param in self._global_model.parameters()]
             return self.trainer.train(
                 client_id=client_id,
                 model=self._global_model,
@@ -396,29 +403,26 @@ class FLServer:
         """
         import concurrent.futures
 
-        n_workers = getattr(self.config, 'num_train_workers', 1) or 1
+        n_workers = getattr(self.config, "num_train_workers", 1) or 1
 
         if n_workers <= 1 or len(selected_ids) <= 1:
             # 串行模式：预克隆一次全局权重，所有客户端复用
-            global_weights = [
-                param.data.clone()
-                for param in self._global_model.parameters()
-            ]
+            global_weights = [param.data.clone() for param in self._global_model.parameters()]
             updates = []
             for i, cid in enumerate(selected_ids):
                 print(".", end="", flush=True)
                 update = self._train_client(
-                    cid, train_loaders, round_num, global_weights=global_weights,
+                    cid,
+                    train_loaders,
+                    round_num,
+                    global_weights=global_weights,
                 )
                 if update is not None:
                     updates.append(update)
             return updates
 
         # 并行模式：预克隆全局权重（只读，线程安全）
-        global_weights = [
-            param.data.clone()
-            for param in self._global_model.parameters()
-        ]
+        global_weights = [param.data.clone() for param in self._global_model.parameters()]
 
         def _train_single(cid: int) -> ClientUpdate | None:
             if cid not in train_loaders:
@@ -442,10 +446,7 @@ class FLServer:
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers,
         ) as executor:
-            future_map = {
-                executor.submit(_train_single, cid): cid
-                for cid in selected_ids
-            }
+            future_map = {executor.submit(_train_single, cid): cid for cid in selected_ids}
             for future in concurrent.futures.as_completed(future_map):
                 result = future.result()
                 if result is not None:
@@ -497,12 +498,29 @@ class FLServer:
 
         # 计算模型大小（字节），供时间模型使用
         model_size_bytes = sum(
-            p.numel() * p.element_size()
-            for p in self._global_model.parameters()
+            p.numel() * p.element_size() for p in self._global_model.parameters()
         )
 
         # 预计算客户端数据量
         client_data_sizes = self._get_client_data_sizes(train_loaders)
+
+        # ── 基线评估（训练前，随机初始化模型）──
+        if verbose:
+            print("  基线评估（随机模型）...", end="", flush=True)
+        baseline_metrics = self.evaluator.evaluate(
+            self._global_model, test_loader, -1,
+        )
+        self._history.append(FLRoundResult(
+            round_num=-1,
+            eval_metrics=baseline_metrics,
+            num_clients=0,
+            train_loss=baseline_metrics.get("loss", 0.0),
+            timeslot_start=0,
+            time_breakdown=None,
+        ))
+        if verbose:
+            acc = baseline_metrics.get("accuracy", 0)
+            print(f" 准确率 {acc:.2%}（随机基线 ≈ 10% for 10类）")
 
         current_ts = 0  # 当前虚拟时间槽
         completed_rounds = 0  # 已完成轮次计数
@@ -536,18 +554,26 @@ class FLServer:
 
             # ── 3. 本地训练（并行 + 时间模型决定耗时）──
             if verbose:
-                print(f"  轮次 {completed_rounds + 1:3d}/{self.config.num_rounds} | "
-                      f"训练 {len(selected_ids)} 客户端...", end="", flush=True)
+                print(
+                    f"  轮次 {completed_rounds + 1:3d}/{self.config.num_rounds} | "
+                    f"训练 {len(selected_ids)} 客户端...",
+                    end="",
+                    flush=True,
+                )
             train_start_ts = current_ts
             updates = self._train_clients_parallel(
-                selected_ids, train_loaders, completed_rounds,
+                selected_ids,
+                train_loaders,
+                completed_rounds,
             )
             max_train_slots = 0
             for update in updates:
                 cid = update.client_id
                 n_samples = client_data_sizes.get(cid, 100)
                 train_slots = self.time_model.compute_train_slots(
-                    cid, n_samples, self.config.local_epochs,
+                    cid,
+                    n_samples,
+                    self.config.local_epochs,
                 )
                 breakdown.per_satellite[cid] = {"train": train_slots}
                 max_train_slots = max(max_train_slots, train_slots)
@@ -573,9 +599,7 @@ class FLServer:
                         )
                         breakdown.per_satellite.setdefault(cid, {})
                         breakdown.per_satellite[cid]["upload"] = upload_slots
-                        breakdown.per_satellite[cid]["wait_return"] = (
-                            contact_ts - current_ts
-                        )
+                        breakdown.per_satellite[cid]["wait_return"] = contact_ts - current_ts
                         return_times.append(contact_ts + upload_slots)
                 if return_times:
                     current_ts = max(return_times)
@@ -596,18 +620,15 @@ class FLServer:
             # upload 单独记录以便分解展示
 
             # ── 5. 聚合 → 新全局模型诞生 ──
-            global_weights = [
-                param.data.clone()
-                for param in self._global_model.parameters()
-            ]
+            global_weights = [param.data.clone() for param in self._global_model.parameters()]
             if self.aggregator.should_aggregate(updates, completed_rounds):
                 new_weights = self.aggregator.aggregate(
-                    global_weights, updates, completed_rounds,
+                    global_weights,
+                    updates,
+                    completed_rounds,
                 )
                 with torch.no_grad():
-                    for param, new_w in zip(
-                        self._global_model.parameters(), new_weights
-                    ):
+                    for param, new_w in zip(self._global_model.parameters(), new_weights):
                         param.data.copy_(new_w)
 
             # 标记客户端参与
@@ -617,12 +638,14 @@ class FLServer:
 
             # ── 6. 评估 ──
             eval_metrics = self.evaluator.evaluate(
-                self._global_model, test_loader, completed_rounds,
+                self._global_model,
+                test_loader,
+                completed_rounds,
             )
 
             # ── 6b. 自适应 μ 反馈 (FedProxSat) ──
             current_acc = eval_metrics.get("accuracy", 0)
-            if hasattr(self.trainer, 'update_accuracy'):
+            if hasattr(self.trainer, "update_accuracy"):
                 _ = self.trainer.update_accuracy(current_acc)
 
             # 计算时间分解总计
@@ -643,11 +666,13 @@ class FLServer:
             completed_rounds += 1
 
             # ── 早停检查 ──
-            early_stop_acc = getattr(self.config, 'early_stop_acc', None)
+            early_stop_acc = getattr(self.config, "early_stop_acc", None)
             if early_stop_acc is not None and current_acc >= early_stop_acc:
                 if verbose:
-                    print(f"\n  >>> 早停触发: 准确率 {current_acc:.4f} >= {early_stop_acc} "
-                          f"(第 {completed_rounds} 轮)")
+                    print(
+                        f"\n  >>> 早停触发: 准确率 {current_acc:.4f} >= {early_stop_acc} "
+                        f"(第 {completed_rounds} 轮)"
+                    )
                 break
 
             # 准备下一轮：从聚合时刻之后开始
@@ -657,7 +682,8 @@ class FLServer:
                 acc = eval_metrics.get("accuracy", 0)
                 conn_at_start = (
                     len(self.scheduler.get_connected_sats(start_ts))
-                    if self.scheduler else len(selected_ids)
+                    if self.scheduler
+                    else len(selected_ids)
                 )
                 # 构建时间分解显示
                 tm_display = self.time_model.slots_to_display(
@@ -687,9 +713,11 @@ class FLServer:
             final_ts = self._history[-1].timeslot
             total_hours = final_ts * sim.timeslot_duration_min / 60.0
             if verbose:
-                print(f"\n  [模拟时间] 总虚拟时间: {final_ts} timeslots = "
-                      f"{total_hours:.1f} 小时 ({total_hours/24:.1f} 天), "
-                      f"预计算: {sim.num_timeslots_pre:.0f} slots")
+                print(
+                    f"\n  [模拟时间] 总虚拟时间: {final_ts} timeslots = "
+                    f"{total_hours:.1f} 小时 ({total_hours / 24:.1f} 天), "
+                    f"预计算: {sim.num_timeslots_pre:.0f} slots"
+                )
 
         return self._history
 
@@ -766,8 +794,7 @@ class FLServer:
 
         if not isinstance(self.aggregator, BufferAggregator):
             raise TypeError(
-                "异步模式需要 BufferAggregator，当前聚合器: "
-                f"{type(self.aggregator).__name__}"
+                f"异步模式需要 BufferAggregator，当前聚合器: {type(self.aggregator).__name__}"
             )
 
         buffer_agg: BufferAggregator = self.aggregator
@@ -784,7 +811,8 @@ class FLServer:
 
             # 2. 选择可参与训练的客户端
             available = self.selector.select(
-                self._clients, global_round,
+                self._clients,
+                global_round,
                 already_training=training_clients,
             )
 
@@ -797,17 +825,14 @@ class FLServer:
 
             # 4. 检查缓冲区是否触发聚合
             if buffer_agg.should_aggregate([], global_round):
-                global_weights = [
-                    param.data.clone()
-                    for param in self._global_model.parameters()
-                ]
+                global_weights = [param.data.clone() for param in self._global_model.parameters()]
                 new_weights = buffer_agg.aggregate(
-                    global_weights, [], global_round,
+                    global_weights,
+                    [],
+                    global_round,
                 )
                 with torch.no_grad():
-                    for param, new_w in zip(
-                        self._global_model.parameters(), new_weights
-                    ):
+                    for param, new_w in zip(self._global_model.parameters(), new_weights):
                         param.data.copy_(new_w)
 
                 global_round += 1
@@ -815,7 +840,9 @@ class FLServer:
                 # 5. 周期性评估
                 if ts % eval_interval == 0:
                     last_eval_metrics = self.evaluator.evaluate(
-                        self._global_model, test_loader, global_round,
+                        self._global_model,
+                        test_loader,
+                        global_round,
                     )
 
                 status = buffer_agg.buffer_status()
@@ -838,7 +865,9 @@ class FLServer:
 
         # 最终评估
         final_metrics = self.evaluator.evaluate(
-            self._global_model, test_loader, global_round,
+            self._global_model,
+            test_loader,
+            global_round,
         )
         if verbose:
             acc = final_metrics.get("accuracy", 0)
@@ -886,9 +915,7 @@ class FLServer:
         elif algo == "fedbuff":
             return self.run_async(model, train_loaders, test_loader, verbose)
         else:
-            raise ValueError(
-                f"未知算法: '{algo}'，支持: fedavg, fedprox, fedbuff"
-            )
+            raise ValueError(f"未知算法: '{algo}'，支持: fedavg, fedprox, fedbuff")
 
     def get_global_model(self) -> Any:
         """返回当前全局模型。"""

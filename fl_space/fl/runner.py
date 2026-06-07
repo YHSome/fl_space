@@ -198,6 +198,7 @@ class FLRunner:
         iid: bool = True,
         alpha: float = 0.5,
         classes_per_client: int | None = None,
+        max_samples_per_client: int = 0,
         data_dir: str = "./data",
     ) -> None:
         """
@@ -214,6 +215,10 @@ class FLRunner:
         alpha : float
             Dirichlet 分布参数（仅 non-IID 时有效）。
             alpha 越小分布越不均匀。
+        classes_per_client : int | None
+            每个客户端限定的类别数，None 使用 Dirichlet。
+        max_samples_per_client : int
+            每个客户端样本数上限，0 表示不限制。
         data_dir : str
             数据下载/缓存目录。
 
@@ -272,6 +277,32 @@ class FLRunner:
             train_ds, n_clients, iid=iid, alpha=alpha,
             classes_per_client=classes_per_client,
         )
+
+        # ── 样本数截断（模拟太空 FL 小数据集）──
+        if max_samples_per_client > 0:
+            for cid in range(len(client_data_indices)):
+                indices = client_data_indices[cid]
+                if len(indices) > max_samples_per_client:
+                    # 为保证类别均衡，先按类别分组再等比例截断
+                    targets = np.array([train_ds[i][1] for i in indices])
+                    unique_cls = np.unique(targets)
+                    truncated = []
+                    samples_per_class = max_samples_per_client // len(unique_cls)
+                    remainder = max_samples_per_client % len(unique_cls)
+                    for cls in unique_cls:
+                        cls_idx = [i for i in indices if train_ds[i][1] == cls]
+                        take = min(samples_per_class + (1 if remainder > 0 else 0), len(cls_idx))
+                        if remainder > 0:
+                            remainder -= 1
+                        truncated.extend(cls_idx[:take])
+                    client_data_indices[cid] = truncated
+
+        # 打印数据分配摘要
+        client_class_dist = {}
+        for cid, indices in enumerate(client_data_indices):
+            classes_present = sorted(set(train_ds[i][1] for i in indices))
+            client_class_dist[cid] = (len(indices), classes_present)
+        self._client_data_summary = client_class_dist
 
         # 创建 DataLoader
         self._train_loaders = {}
@@ -418,9 +449,10 @@ class FLRunner:
     def run(
         self,
         dataset_name: str = "mnist",
-        iid: bool = True,
-        alpha: float = 0.5,
+        iid: bool | None = None,
+        alpha: float | None = None,
         classes_per_client: int | None = None,
+        max_samples_per_client: int | None = None,
         data_dir: str = "./data",
         verbose: bool = True,
     ) -> list[FLRoundResult]:
@@ -429,14 +461,20 @@ class FLRunner:
 
         自动完成：数据加载 → 模型创建 → 训练执行。
 
+        数据划分参数优先从 config 读取，方法参数仅作覆盖用途。
+
         Parameters
         ----------
         dataset_name : str
             数据集名称。
-        iid : bool
-            是否 IID 分配。
-        alpha : float
+        iid : bool | None
+            是否 IID 分配（None 则从 config 推断）。
+        alpha : float | None
             non-IID Dirichlet 参数。
+        classes_per_client : int | None
+            每客户端类别数（None 则从 config 读取）。
+        max_samples_per_client : int | None
+            每客户端样本上限（None 则从 config 读取，0=不限）。
         data_dir : str
             数据目录。
         verbose : bool
@@ -456,6 +494,18 @@ class FLRunner:
             for r in history:
                 print(f"轮次 {r.round_num}: 准确率 {r.eval_metrics['accuracy']}")
         """
+        # 从 config 读取默认值
+        _iid = iid if iid is not None else (getattr(self.config, 'classes_per_client', 0) == 0)
+        _alpha = alpha if alpha is not None else 0.5
+        _cpc = (
+            classes_per_client if classes_per_client is not None
+            else getattr(self.config, 'classes_per_client', None)
+        )
+        _max_spc = (
+            max_samples_per_client if max_samples_per_client is not None
+            else getattr(self.config, 'max_samples_per_client', 0)
+        )
+
         if verbose:
             print("=== SpaceFL 实验 ===")
             print(f"  算法: {self.config.algorithm}")
@@ -463,6 +513,12 @@ class FLRunner:
             print(f"  客户端: {self.config.num_clients}")
             print(f"  轮次: {self.config.num_rounds}")
             print(f"  设备: {self.config.device}")
+            if _cpc:
+                print(f"  数据: non-IID (每客户端 {_cpc} 类, 上限 {_max_spc} 样本)")
+            elif not _iid:
+                print(f"  数据: non-IID (Dirichlet α={_alpha}, 上限 {_max_spc} 样本)")
+            else:
+                print(f"  数据: IID (上限 {_max_spc} 样本)" if _max_spc else "  数据: IID")
             print()
 
         # 1. 数据准备
@@ -470,9 +526,10 @@ class FLRunner:
             print("[1/3] 加载数据...")
         self.prepare_data(
             dataset_name=dataset_name,
-            iid=iid,
-            alpha=alpha,
-            classes_per_client=classes_per_client,
+            iid=_iid,
+            alpha=_alpha,
+            classes_per_client=_cpc,
+            max_samples_per_client=_max_spc,
             data_dir=data_dir,
         )
 

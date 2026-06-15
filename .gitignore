@@ -27,5 +27,8 @@ Thumbs.db
 # Results
 results/
 
+# Generated output
+experiment_output/
+
 # Session
 .fls_session.json

@@ -234,6 +234,7 @@ class BufferAggregator(Aggregator):
 
         # 全局轮次计数器（用于 staleness 计算）
         self._global_round: int = 0
+        self._last_aggregate_count: int = 0
 
         # 线程安全锁
         self._lock = threading.Lock()
@@ -275,37 +276,37 @@ class BufferAggregator(Aggregator):
         round_num: int,
         **kwargs: Any,
     ) -> list[torch.Tensor]:
-        """
-        从缓冲区取出 K 个更新进行加权平均聚合。
-
-        Parameters
-        ----------
-        global_weights : list
-            当前全局模型参数。
-        updates : list[ClientUpdate]
-            忽略（使用内部缓冲区）。
-        round_num : int
-            全局轮次（用于 staleness 标记）。
-
-        Returns
-        -------
-        list
-            聚合后的全局模型参数。
-        """
+        """Aggregate buffered updates with optional normalized staleness weighting."""
         with self._lock:
             self._global_round += 1
 
             if len(self._buffer) < self.buffer_size:
+                self._last_aggregate_count = 0
                 return global_weights
 
-            # 取出缓冲区中最旧的 K 个更新
             batch_updates = [
                 self._buffer.popleft()
                 for _ in range(self.buffer_size)
             ]
+            self._last_aggregate_count = len(batch_updates)
 
         total_size = sum(u.data_size for u in batch_updates)
         if total_size == 0:
+            return global_weights
+
+        effective_weights: list[tuple[ClientUpdate, float]] = []
+        total_effective_weight = 0.0
+        for update in batch_updates:
+            staleness = max(0, self._global_round - update.round_num)
+            base_weight = update.data_size / total_size
+            if self.staleness_weight and staleness > 0:
+                effective_weight = base_weight / (1 + staleness)
+            else:
+                effective_weight = base_weight
+            effective_weights.append((update, effective_weight))
+            total_effective_weight += effective_weight
+
+        if total_effective_weight <= 0:
             return global_weights
 
         aggregated = [
@@ -313,19 +314,9 @@ class BufferAggregator(Aggregator):
             for w in global_weights
         ]
 
-        for update in batch_updates:
-            staleness = self._global_round - update.round_num
-            base_weight = update.data_size / total_size
-
-            # 陈旧度降权: w = 1 / (1 + staleness)
-            if self.staleness_weight and staleness > 0:
-                weight_ratio = base_weight / (1 + staleness)
-            else:
-                weight_ratio = base_weight
-
-            for i, (agg_w, client_w) in enumerate(
-                zip(aggregated, update.weights)
-            ):
+        for update, effective_weight in effective_weights:
+            weight_ratio = effective_weight / total_effective_weight
+            for agg_w, client_w in zip(aggregated, update.weights):
                 if isinstance(client_w, torch.Tensor):
                     agg_w.add_(client_w.float() * weight_ratio)
                 else:
@@ -349,6 +340,7 @@ class BufferAggregator(Aggregator):
                 "buffer_size": self.buffer_size,
                 "current_count": len(self._buffer),
                 "global_round": self._global_round,
+                "last_aggregate_count": self._last_aggregate_count,
             }
 
 

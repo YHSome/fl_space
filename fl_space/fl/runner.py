@@ -102,6 +102,7 @@ class FLRunner:
         self._train_loaders: dict[int, DataLoader] = {}
         self._test_loader: DataLoader | None = None
         self._model: Any = None
+        self._dataset_model_kwargs: dict[str, Any] = {}
 
     @classmethod
     def from_preset(
@@ -200,6 +201,11 @@ class FLRunner:
         classes_per_client: int | None = None,
         max_samples_per_client: int = 0,
         data_dir: str = "./data",
+        partition_strategy: str = "probability",
+        class_probability: float = 0.8,
+        preference_mode: str = "class_balanced",
+        preferred_clients_per_class: int = 1,
+        sample_cap_strategy: str = "preserve",
     ) -> None:
         """
         加载数据集并分配到客户端。
@@ -244,6 +250,7 @@ class FLRunner:
             )
             train_ds = ds_cls(data_dir, train=True, download=True, transform=transform)
             test_ds = ds_cls(data_dir, train=False, download=True, transform=transform)
+            self._dataset_model_kwargs = {}
 
         elif dataset_name == "cifar10":
             transform_train = transforms.Compose([
@@ -268,6 +275,35 @@ class FLRunner:
             test_ds = datasets.CIFAR10(
                 data_dir, train=False, download=True, transform=transform_test,
             )
+            self._dataset_model_kwargs = {}
+        elif dataset_name in ("imagefolder", "custom"):
+            train_dir = f"{data_dir}/train"
+            test_dir = f"{data_dir}/test"
+            transform_train = transforms.Compose([
+                transforms.Lambda(lambda img: img.convert("RGB")),
+                transforms.Resize((32, 32)),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    (0.4914, 0.4822, 0.4465),
+                    (0.2023, 0.1994, 0.2010),
+                ),
+            ])
+            transform_test = transforms.Compose([
+                transforms.Lambda(lambda img: img.convert("RGB")),
+                transforms.Resize((32, 32)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    (0.4914, 0.4822, 0.4465),
+                    (0.2023, 0.1994, 0.2010),
+                ),
+            ])
+            train_ds = datasets.ImageFolder(train_dir, transform=transform_train)
+            test_ds = datasets.ImageFolder(test_dir, transform=transform_test)
+            self._dataset_model_kwargs = {
+                "num_classes": len(train_ds.classes),
+                "in_channels": 3,
+            }
         else:
             raise ValueError(f"不支持的数据集: '{dataset_name}'")
 
@@ -276,31 +312,30 @@ class FLRunner:
         client_data_indices = self._partition_data(
             train_ds, n_clients, iid=iid, alpha=alpha,
             classes_per_client=classes_per_client,
+            partition_strategy=partition_strategy,
+            class_probability=class_probability,
+            preference_mode=preference_mode,
+            preferred_clients_per_class=preferred_clients_per_class,
         )
 
         # ── 样本数截断（模拟太空 FL 小数据集）──
+        targets = np.array([train_ds[i][1] for i in range(len(train_ds))])
         if max_samples_per_client > 0:
-            for cid in range(len(client_data_indices)):
-                indices = client_data_indices[cid]
-                if len(indices) > max_samples_per_client:
-                    # 为保证类别均衡，先按类别分组再等比例截断
-                    targets = np.array([train_ds[i][1] for i in indices])
-                    unique_cls = np.unique(targets)
-                    truncated = []
-                    samples_per_class = max_samples_per_client // len(unique_cls)
-                    remainder = max_samples_per_client % len(unique_cls)
-                    for cls in unique_cls:
-                        cls_idx = [i for i in indices if train_ds[i][1] == cls]
-                        take = min(samples_per_class + (1 if remainder > 0 else 0), len(cls_idx))
-                        if remainder > 0:
-                            remainder -= 1
-                        truncated.extend(cls_idx[:take])
-                    client_data_indices[cid] = truncated
+            client_data_indices = self._cap_client_samples(
+                client_data_indices,
+                targets,
+                max_samples_per_client,
+                sample_cap_strategy,
+            )
 
-        # 打印数据分配摘要
+        self._client_label_distribution = self._build_label_distribution(
+            client_data_indices,
+            targets,
+        )
+
         client_class_dist = {}
         for cid, indices in enumerate(client_data_indices):
-            classes_present = sorted(set(train_ds[i][1] for i in indices))
+            classes_present = sorted({train_ds[i][1] for i in indices})
             client_class_dist[cid] = (len(indices), classes_present)
         self._client_data_summary = client_class_dist
 
@@ -309,6 +344,10 @@ class FLRunner:
         num_workers = getattr(self.config, 'num_workers', 0) or 0
         for cid, indices in enumerate(client_data_indices):
             subset = Subset(train_ds, indices)
+            generator = None
+            if getattr(self.config, "seed", None) is not None:
+                generator = torch.Generator()
+                generator.manual_seed(int(self.config.seed) + cid)
             self._train_loaders[cid] = DataLoader(
                 subset,
                 batch_size=self.config.batch_size,
@@ -316,6 +355,7 @@ class FLRunner:
                 drop_last=False,
                 num_workers=num_workers,
                 pin_memory=(self.config.device == "cuda"),
+                generator=generator,
             )
 
         self._test_loader = DataLoader(
@@ -333,99 +373,218 @@ class FLRunner:
         iid: bool = True,
         alpha: float = 0.5,
         classes_per_client: int | None = None,
+        partition_strategy: str = "probability",
+        class_probability: float = 0.8,
+        preference_mode: str = "class_balanced",
+        preferred_clients_per_class: int = 1,
     ) -> list[list[int]]:
-        """
-        将数据集划分为 n_clients 份。
-
-        Parameters
-        ----------
-        dataset : Dataset
-            训练数据集。
-        n_clients : int
-            客户端数量。
-        iid : bool
-            True 为 IID，False 为 non-IID (Dirichlet)。
-        alpha : float
-            Dirichlet 参数（仅 non-IID 且未指定 classes_per_client）。
-        classes_per_client : int | None
-            每个客户端限定的类别数，如 2 表示每个卫星只拿 2 类数字。
-            使用滑动窗口分配：client i 拿到 i, i+1, ... (mod n_classes)。
-            指定此参数后忽略 alpha。
-
-        Returns
-        -------
-        list[list[int]]
-            每个客户端的样本索引列表。
-        """
+        """Split a dataset into client shards for IID and non-IID experiments."""
         n_samples = len(dataset)
         targets = np.array([dataset[i][1] for i in range(n_samples)])
-        n_classes = len(np.unique(targets))
+        classes = np.unique(targets)
+        n_classes = len(classes)
+        rng = np.random.default_rng(getattr(self.config, "seed", None))
 
+        strategy = (partition_strategy or "probability").lower()
         if iid:
-            # IID：随机打乱后均匀分配
-            indices = np.random.permutation(n_samples)
+            strategy = "iid"
+        elif classes_per_client is not None and classes_per_client <= 0:
+            classes_per_client = None
+            if strategy in ("probability", "shard"):
+                strategy = "dirichlet"
+
+        if strategy == "iid":
+            indices = rng.permutation(n_samples)
             split_size = n_samples // n_clients
             client_indices = [
-                indices[i * split_size:(i + 1) * split_size].tolist()
+                indices[i * split_size : (i + 1) * split_size].tolist()
                 for i in range(n_clients)
             ]
-            remainder = indices[n_clients * split_size:]
+            remainder = indices[n_clients * split_size :]
             if len(remainder) > 0:
                 client_indices[-1].extend(remainder.tolist())
-        elif classes_per_client is not None:
-            # 固定类别数：每客户端精确限定 k 个类别（滑动窗口 cyclic）
+            return client_indices
+
+        if strategy == "shard" and classes_per_client is not None:
             client_indices = [[] for _ in range(n_clients)]
             k = min(classes_per_client, n_classes)
-
-            # 预计算每个类别分配给哪些客户端
-            class_to_clients: dict[int, list[int]] = {c: [] for c in range(n_classes)}
+            class_to_clients: dict[int, list[int]] = {int(c): [] for c in classes}
             for cid in range(n_clients):
                 for offset in range(k):
-                    cls = (cid + offset) % n_classes
+                    cls = int(classes[(cid + offset) % n_classes])
                     class_to_clients[cls].append(cid)
 
-            # 按类别分配：该类样本均分给包含它的客户端
-            for c in range(n_classes):
+            for c in classes:
+                c_int = int(c)
                 class_indices = np.where(targets == c)[0]
-                np.random.shuffle(class_indices)
-                n_holders = len(class_to_clients[c])
-                if n_holders == 0:
-                    continue  # 该类别未被任何客户端持有，跳过
-                split_sz = len(class_indices) // n_holders
-                start = 0
-                for h_idx, cid in enumerate(class_to_clients[c]):
-                    end = start + split_sz + (1 if h_idx < len(class_indices) % n_holders else 0)
-                    client_indices[cid].extend(class_indices[start:end].tolist())
-                    start = end
-        else:
-            # Non-IID：Dirichlet 分布
-            client_indices = [[] for _ in range(n_clients)]
+                rng.shuffle(class_indices)
+                holders = class_to_clients[c_int]
+                if not holders:
+                    continue
+                split_sz = len(class_indices) // len(holders)
+                start_idx = 0
+                for h_idx, cid in enumerate(holders):
+                    extra = 1 if h_idx < len(class_indices) % len(holders) else 0
+                    end_idx = start_idx + split_sz + extra
+                    client_indices[cid].extend(class_indices[start_idx:end_idx].tolist())
+                    start_idx = end_idx
+            return client_indices
 
-            for c in range(n_classes):
-                class_indices = np.where(targets == c)[0]
-                np.random.shuffle(class_indices)
+        if strategy == "probability" and classes_per_client is not None:
+            return self._partition_probability(
+                targets=targets,
+                classes=classes,
+                n_clients=n_clients,
+                class_probability=class_probability,
+                preference_mode=preference_mode,
+                classes_per_client=classes_per_client,
+                preferred_clients_per_class=preferred_clients_per_class,
+                rng=rng,
+            )
 
-                proportions = np.random.dirichlet(
-                    np.repeat(alpha, n_clients)
-                )
-                proportions = (
-                    proportions * len(class_indices)
-                ).astype(int)
+        client_indices = [[] for _ in range(n_clients)]
+        for c in classes:
+            class_indices = np.where(targets == c)[0]
+            rng.shuffle(class_indices)
+            proportions = rng.dirichlet(np.repeat(alpha, n_clients))
+            proportions = (proportions * len(class_indices)).astype(int)
+            proportions[-1] += len(class_indices) - proportions.sum()
 
-                diff = len(class_indices) - proportions.sum()
-                proportions[-1] += diff
-
-                start = 0
-                for cid in range(n_clients):
-                    end = start + proportions[cid]
-                    client_indices[cid].extend(
-                        class_indices[start:end].tolist()
-                    )
-                    start = end
+            start_idx = 0
+            for cid in range(n_clients):
+                end_idx = start_idx + proportions[cid]
+                client_indices[cid].extend(class_indices[start_idx:end_idx].tolist())
+                start_idx = end_idx
 
         return client_indices
 
-    # ── 模型创建 ──────────────────────────────────────────────
+    def _partition_probability(
+        self,
+        *,
+        targets: np.ndarray,
+        classes: np.ndarray,
+        n_clients: int,
+        class_probability: float,
+        preference_mode: str,
+        classes_per_client: int,
+        preferred_clients_per_class: int,
+        rng: np.random.Generator,
+    ) -> list[list[int]]:
+        client_indices = [[] for _ in range(n_clients)]
+        p_preferred = min(max(float(class_probability), 0.0), 1.0)
+        mode = (preference_mode or "class_balanced").lower()
+
+        if mode == "class_balanced":
+            holders = max(1, min(int(preferred_clients_per_class), n_clients))
+            for class_pos, c in enumerate(classes):
+                preferred = [(class_pos + offset) % n_clients for offset in range(holders)]
+                class_indices = np.where(targets == c)[0]
+                rng.shuffle(class_indices)
+                for sample_idx in class_indices:
+                    if rng.random() < p_preferred:
+                        cid = int(rng.choice(preferred))
+                    else:
+                        cid = int(rng.integers(0, n_clients))
+                    client_indices[cid].append(int(sample_idx))
+            return client_indices
+
+        k = min(classes_per_client, len(classes))
+        class_to_clients: dict[int, list[int]] = {int(c): [] for c in classes}
+        for cid in range(n_clients):
+            for offset in range(k):
+                cls = int(classes[(cid + offset) % len(classes)])
+                class_to_clients[cls].append(cid)
+
+        for c in classes:
+            c_int = int(c)
+            class_indices = np.where(targets == c)[0]
+            rng.shuffle(class_indices)
+            preferred = class_to_clients.get(c_int) or list(range(n_clients))
+            for sample_idx in class_indices:
+                if rng.random() < p_preferred:
+                    cid = int(rng.choice(preferred))
+                else:
+                    cid = int(rng.integers(0, n_clients))
+                client_indices[cid].append(int(sample_idx))
+        return client_indices
+
+    def _cap_client_samples(
+        self,
+        client_indices: list[list[int]],
+        targets: np.ndarray,
+        max_samples_per_client: int,
+        sample_cap_strategy: str,
+    ) -> list[list[int]]:
+        rng = np.random.default_rng(getattr(self.config, "seed", None))
+        strategy = (sample_cap_strategy or "preserve").lower()
+        capped: list[list[int]] = []
+
+        for indices in client_indices:
+            if len(indices) <= max_samples_per_client:
+                capped.append(indices)
+                continue
+
+            if strategy == "balanced":
+                unique_cls = np.unique(targets[indices])
+                truncated: list[int] = []
+                samples_per_class = max_samples_per_client // len(unique_cls)
+                remainder = max_samples_per_client % len(unique_cls)
+                for cls in unique_cls:
+                    cls_idx = [idx for idx in indices if targets[idx] == cls]
+                    rng.shuffle(cls_idx)
+                    take = min(samples_per_class + (1 if remainder > 0 else 0), len(cls_idx))
+                    if remainder > 0:
+                        remainder -= 1
+                    truncated.extend(cls_idx[:take])
+                capped.append(truncated)
+                continue
+
+            shuffled = np.array(indices)
+            rng.shuffle(shuffled)
+            capped.append(shuffled[:max_samples_per_client].astype(int).tolist())
+
+        return capped
+
+    def _build_label_distribution(
+        self,
+        client_indices: list[list[int]],
+        targets: np.ndarray,
+    ) -> dict[str, Any]:
+        labels = sorted(int(x) for x in np.unique(targets))
+        clients: dict[str, Any] = {}
+        entropies: list[float] = []
+
+        for cid, indices in enumerate(client_indices):
+            counts = dict.fromkeys(labels, 0)
+            for idx in indices:
+                counts[int(targets[idx])] += 1
+
+            total = sum(counts.values())
+            ratios = {label: count / total for label, count in counts.items() if total > 0}
+            entropy = -sum(ratio * float(np.log2(ratio)) for ratio in ratios.values() if ratio > 0)
+            entropies.append(entropy)
+            top_classes = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:5]
+            clients[str(cid)] = {
+                "num_samples": total,
+                "num_classes": sum(1 for count in counts.values() if count > 0),
+                "entropy": round(entropy, 6),
+                "class_counts": {str(label): int(count) for label, count in counts.items()},
+                "top_classes": [
+                    {
+                        "label": int(label),
+                        "count": int(count),
+                        "ratio": round(count / total, 6) if total > 0 else 0.0,
+                    }
+                    for label, count in top_classes
+                ],
+            }
+
+        return {
+            "num_clients": len(client_indices),
+            "num_classes": len(labels),
+            "avg_entropy": round(float(np.mean(entropies)), 6) if entropies else 0.0,
+            "clients": clients,
+        }
 
     def prepare_model(
         self,
@@ -454,6 +613,11 @@ class FLRunner:
         classes_per_client: int | None = None,
         max_samples_per_client: int | None = None,
         data_dir: str = "./data",
+        partition_strategy: str | None = None,
+        class_probability: float | None = None,
+        preference_mode: str | None = None,
+        preferred_clients_per_class: int | None = None,
+        sample_cap_strategy: str | None = None,
         verbose: bool = True,
     ) -> list[FLRoundResult]:
         """
@@ -505,6 +669,27 @@ class FLRunner:
             max_samples_per_client if max_samples_per_client is not None
             else getattr(self.config, 'max_samples_per_client', 0)
         )
+        _data_dir = data_dir if data_dir != "./data" else getattr(self.config, "data_dir", data_dir)
+        _partition_strategy = (
+            partition_strategy if partition_strategy is not None
+            else getattr(self.config, "partition_strategy", "probability")
+        )
+        _class_probability = (
+            class_probability if class_probability is not None
+            else getattr(self.config, "class_probability", 0.8)
+        )
+        _preference_mode = (
+            preference_mode if preference_mode is not None
+            else getattr(self.config, "preference_mode", "class_balanced")
+        )
+        _preferred_clients_per_class = (
+            preferred_clients_per_class if preferred_clients_per_class is not None
+            else getattr(self.config, "preferred_clients_per_class", 1)
+        )
+        _sample_cap_strategy = (
+            sample_cap_strategy if sample_cap_strategy is not None
+            else getattr(self.config, "sample_cap_strategy", "preserve")
+        )
 
         if verbose:
             print("=== SpaceFL 实验 ===")
@@ -530,7 +715,12 @@ class FLRunner:
             alpha=_alpha,
             classes_per_client=_cpc,
             max_samples_per_client=_max_spc,
-            data_dir=data_dir,
+            data_dir=_data_dir,
+            partition_strategy=_partition_strategy,
+            class_probability=_class_probability,
+            preference_mode=_preference_mode,
+            preferred_clients_per_class=_preferred_clients_per_class,
+            sample_cap_strategy=_sample_cap_strategy,
         )
 
         # 2. 模型准备
@@ -540,9 +730,11 @@ class FLRunner:
         if TORCH_AVAILABLE and hasattr(self.config, 'seed') and self.config.seed is not None:
             torch.manual_seed(self.config.seed)
         ds_preset = DATASET_PRESETS.get(dataset_name, DATASET_PRESETS["mnist"])
+        model_kwargs = dict(ds_preset.get("model_kwargs", {}))
+        model_kwargs.update(self._dataset_model_kwargs)
         self.prepare_model(
             model_name=ds_preset["model"],
-            **ds_preset.get("model_kwargs", {}),
+            **model_kwargs,
         )
 
         # 3. 训练
@@ -584,6 +776,11 @@ class FLRunner:
                 print(f"  时间模型: {tm.name}")
 
         return history
+
+    @property
+    def client_label_distribution(self) -> dict[str, Any]:
+        """Client-side label distribution generated during data preparation."""
+        return getattr(self, "_client_label_distribution", {})
 
     @property
     def history_dict(self) -> list[dict[str, Any]]:

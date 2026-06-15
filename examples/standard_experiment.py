@@ -133,6 +133,7 @@ class SingleExperiment:
     contact_stats: dict = field(default_factory=dict)
     elapsed_sec: float = 0.0
     config: dict = field(default_factory=dict)
+    label_distribution: dict = field(default_factory=dict)
 
 
 def run_single_experiment(
@@ -148,7 +149,7 @@ def run_single_experiment(
     inclination_deg: float = 53.0,
     dataset: str = "mnist",
     device: str = "cpu",
-    sim_hours: float = 168.0,
+    sim_hours: float = 3.0,
     timeslot_duration_min: float = 1.0,
     seed: int = 42,
     num_train_workers: int = 1,
@@ -163,6 +164,13 @@ def run_single_experiment(
     non_iid: bool = True,
     classes_per_client: int = 2,
     max_samples_per_client: int = 1000,
+    partition_strategy: str = "probability",
+    class_probability: float = 0.8,
+    preference_mode: str = "class_balanced",
+    preferred_clients_per_class: int = 1,
+    sample_cap_strategy: str = "preserve",
+    data_dir: str = "./data",
+    limit_to_sim_window: bool = True,
 ) -> SingleExperiment:
     """运行单组 SpaceFL 实验。"""
     t0 = _time.time()
@@ -222,6 +230,13 @@ def run_single_experiment(
         early_stop_acc=early_stop_acc,
         num_train_workers=num_train_workers,
         num_workers=num_workers,
+        partition_strategy=partition_strategy,
+        class_probability=class_probability,
+        preference_mode=preference_mode,
+        preferred_clients_per_class=preferred_clients_per_class,
+        sample_cap_strategy=sample_cap_strategy,
+        data_dir=data_dir,
+        limit_to_sim_window=limit_to_sim_window,
     )
 
     scheduler = CommunicationScheduler(sim)
@@ -246,6 +261,12 @@ def run_single_experiment(
         alpha=0.5,
         classes_per_client=classes_per_client,
         max_samples_per_client=max_samples_per_client,
+        data_dir=data_dir,
+        partition_strategy=partition_strategy,
+        class_probability=class_probability,
+        preference_mode=preference_mode,
+        preferred_clients_per_class=preferred_clients_per_class,
+        sample_cap_strategy=sample_cap_strategy,
         verbose=verbose,
     )
 
@@ -278,6 +299,7 @@ def run_single_experiment(
         sim=sim,
         contact_stats=contact_stats,
         elapsed_sec=elapsed,
+        label_distribution=runner.client_label_distribution,
         config={
             "gs_count": gs_count,
             "sat_count": sat_count,
@@ -298,6 +320,16 @@ def run_single_experiment(
             "seed": seed,
             "completed_rounds": len(history_dict),
             "elapsed_sec": elapsed,
+            "non_iid": non_iid,
+            "classes_per_client": classes_per_client,
+            "max_samples_per_client": max_samples_per_client,
+            "partition_strategy": partition_strategy,
+            "class_probability": class_probability,
+            "preference_mode": preference_mode,
+            "preferred_clients_per_class": preferred_clients_per_class,
+            "sample_cap_strategy": sample_cap_strategy,
+            "data_dir": data_dir,
+            "limit_to_sim_window": limit_to_sim_window,
         },
     )
 
@@ -400,6 +432,12 @@ def generate_standard_outputs(exp: SingleExperiment, output_dir: str, quiet: boo
     # 2. history.json
     _save_json(os.path.join(output_dir, "history.json"), exp.history)
 
+    # 2b. client_label_distribution.json
+    _save_json(
+        os.path.join(output_dir, "client_label_distribution.json"),
+        exp.label_distribution,
+    )
+
     # 3. summary.json
     if exp.history:
         accs = [h["accuracy"] for h in exp.history]
@@ -419,6 +457,7 @@ def generate_standard_outputs(exp: SingleExperiment, output_dir: str, quiet: boo
             "elapsed_sec": exp.elapsed_sec,
             "contact_rate": exp.contact_stats.get("global", {}).get("contact_rate", 0),
             "contact_stats": exp.contact_stats["global"],
+            "avg_label_entropy": exp.label_distribution.get("avg_entropy", 0),
         }
     else:
         summary = {"error": "no training history"}
@@ -873,7 +912,7 @@ def run_experiment_grid(
     inclination_deg: float = 53.0,
     dataset: str = "mnist",
     device: str = "cpu",
-    sim_hours: float = 168.0,
+    sim_hours: float = 3.0,
     timeslot_duration_min: float = 1.0,
     seed: int = 42,
     num_train_workers: int = 1,
@@ -889,6 +928,13 @@ def run_experiment_grid(
     non_iid: bool = True,
     classes_per_client: int = 2,
     max_samples_per_client: int = 1000,
+    partition_strategy: str = "probability",
+    class_probability: float = 0.8,
+    preference_mode: str = "class_balanced",
+    preferred_clients_per_class: int = 1,
+    sample_cap_strategy: str = "preserve",
+    data_dir: str = "./data",
+    limit_to_sim_window: bool = True,
 ) -> list[SingleExperiment]:
     """运行完整的网格搜索实验套件。"""
     os.makedirs(output_dir, exist_ok=True)
@@ -943,6 +989,13 @@ def run_experiment_grid(
                 non_iid=non_iid,
                 classes_per_client=classes_per_client,
                 max_samples_per_client=max_samples_per_client,
+                partition_strategy=partition_strategy,
+                class_probability=class_probability,
+                preference_mode=preference_mode,
+                preferred_clients_per_class=preferred_clients_per_class,
+                sample_cap_strategy=sample_cap_strategy,
+                data_dir=data_dir,
+                limit_to_sim_window=limit_to_sim_window,
             )
 
             exp_dir = os.path.join(output_dir, f"gs{gs}_sat{sat}")
@@ -1097,17 +1150,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--inclination", type=float, default=53.0, help="轨道倾角° (默认: 53)")
     p.add_argument(
         "--dataset",
-        choices=["mnist", "fashion_mnist", "cifar10"],
+        choices=["mnist", "fashion_mnist", "cifar10", "imagefolder", "custom"],
         default="mnist",
         help="数据集 (默认: mnist)",
     )
     p.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
-    p.add_argument("--sim-hours", type=float, default=168.0, help="模拟时长/小时 (默认: 168 = 7天)")
+    p.add_argument("--sim-hours", type=float, default=3.0, help="模拟时长/小时 (默认: 168 = 7天)")
     p.add_argument("--timeslot-min", type=float, default=1.0, help="每 timeslot 分钟 (默认: 1)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--train-workers", type=int, default=1)
     p.add_argument("--data-workers", type=int, default=0)
     p.add_argument("--output", "-o", type=str, default="experiment_output")
+    p.add_argument("--partition-strategy", choices=["iid", "dirichlet", "shard", "probability"], default="probability")
+    p.add_argument("--class-probability", type=float, default=0.8)
+    p.add_argument("--data-dir", type=str, default="./data")
     p.add_argument("--quiet", "-q", action="store_true")
     return p
 
@@ -1137,6 +1193,13 @@ def main(argv: list[str] | None = None) -> int:
         num_workers=args.data_workers,
         output_dir=args.output,
         verbose=not args.quiet,
+        partition_strategy=args.partition_strategy,
+        class_probability=args.class_probability,
+        preference_mode=args.preference_mode,
+        preferred_clients_per_class=args.preferred_clients_per_class,
+        sample_cap_strategy=args.sample_cap_strategy,
+        data_dir=args.data_dir,
+        limit_to_sim_window=not args.allow_sim_extension,
     )
 
     total_elapsed = _time.time() - t_start

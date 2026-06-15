@@ -43,6 +43,12 @@ DEFAULT_SESSION: dict[str, dict[str, Any]] = {
         "alpha": 0.5,
         "classes_per_client": 2,
         "max_samples": 1000,
+        "partition_strategy": "probability",
+        "class_probability": 0.8,
+        "preference_mode": "class_balanced",
+        "preferred_clients_per_class": 1,
+        "sample_cap_strategy": "preserve",
+        "data_dir": "./data",
         "device": "cpu",
         "buffer_size": 5,
     },
@@ -59,7 +65,7 @@ DEFAULT_SESSION: dict[str, dict[str, Any]] = {
         "staleness": False,
         "sats": 5,
         "stations": 3,
-        "sim_hours": 24.0,
+        "sim_hours": 3.0,
         "timeslot_min": 1.0,
         "altitude": 500.0,
         "inclination": 53.0,
@@ -271,6 +277,58 @@ def cmd_tune_max_samples(args: argparse.Namespace) -> int:
     return _tune_set(args, "max_samples", int)
 
 
+def cmd_tune_partition_strategy(args: argparse.Namespace) -> int:
+    val = args.value.lower()
+    if val not in ("iid", "dirichlet", "shard", "probability"):
+        print("??: partition_strategy ?? iid, dirichlet, shard, probability")
+        return 1
+    s = load_session()
+    s["tune"]["partition_strategy"] = val
+    save_session(s)
+    print(f"  [tune] partition_strategy = {val}")
+    return 0
+
+
+def cmd_tune_class_probability(args: argparse.Namespace) -> int:
+    return _tune_set(args, "class_probability")
+
+
+def cmd_tune_data_dir(args: argparse.Namespace) -> int:
+    s = load_session()
+    s["tune"]["data_dir"] = args.value
+    save_session(s)
+    print(f"  [tune] data_dir = {args.value}")
+    return 0
+
+
+def cmd_tune_preference_mode(args: argparse.Namespace) -> int:
+    val = args.value.lower()
+    if val not in ("client_window", "class_balanced"):
+        print("??: preference_mode ?? client_window, class_balanced")
+        return 1
+    s = load_session()
+    s["tune"]["preference_mode"] = val
+    save_session(s)
+    print(f"  [tune] preference_mode = {val}")
+    return 0
+
+
+def cmd_tune_preferred_clients_per_class(args: argparse.Namespace) -> int:
+    return _tune_set(args, "preferred_clients_per_class", int)
+
+
+def cmd_tune_sample_cap_strategy(args: argparse.Namespace) -> int:
+    val = args.value.lower()
+    if val not in ("preserve", "balanced"):
+        print("??: sample_cap_strategy ?? preserve, balanced")
+        return 1
+    s = load_session()
+    s["tune"]["sample_cap_strategy"] = val
+    save_session(s)
+    print(f"  [tune] sample_cap_strategy = {val}")
+    return 0
+
+
 def cmd_tune_show(args: argparse.Namespace) -> int:
     """显示当前 tune 参数。"""
     s = load_session()
@@ -480,6 +538,15 @@ def _merge_json_into_session(session: dict, data: dict) -> None:
         "non_iid": ("tune", "non_iid"),
         "alpha": ("tune", "alpha"),
         "early_stop_acc": ("tune", "early_stop"),
+        "classes_per_client": ("tune", "classes_per_client"),
+        "max_samples_per_client": ("tune", "max_samples"),
+        "partition_strategy": ("tune", "partition_strategy"),
+        "class_probability": ("tune", "class_probability"),
+        "data_dir": ("tune", "data_dir"),
+        "preference_mode": ("tune", "preference_mode"),
+        "preferred_clients_per_class": ("tune", "preferred_clients_per_class"),
+        "sample_cap_strategy": ("tune", "sample_cap_strategy"),
+        "dataset": ("tune", "dataset"),
     }
     for json_key, (section, sess_key) in key_map.items():
         if json_key in data:
@@ -664,6 +731,24 @@ def cmd_run_train(args: argparse.Namespace) -> int:
         overrides["device"] = args.device
     if getattr(args, "seed", None) is not None:
         overrides["seed"] = args.seed
+    if getattr(args, "partition_strategy", None) is not None:
+        overrides["partition_strategy"] = args.partition_strategy
+        t["partition_strategy"] = args.partition_strategy
+    if getattr(args, "class_probability", None) is not None:
+        overrides["class_probability"] = args.class_probability
+        t["class_probability"] = args.class_probability
+    if getattr(args, "data_dir", None) is not None:
+        overrides["data_dir"] = args.data_dir
+        t["data_dir"] = args.data_dir
+    if getattr(args, "preference_mode", None) is not None:
+        overrides["preference_mode"] = args.preference_mode
+        t["preference_mode"] = args.preference_mode
+    if getattr(args, "preferred_clients_per_class", None) is not None:
+        overrides["preferred_clients_per_class"] = args.preferred_clients_per_class
+        t["preferred_clients_per_class"] = args.preferred_clients_per_class
+    if getattr(args, "sample_cap_strategy", None) is not None:
+        overrides["sample_cap_strategy"] = args.sample_cap_strategy
+        t["sample_cap_strategy"] = args.sample_cap_strategy
 
     time_model = getattr(args, "time_model", None) or m["time_model"]
     if time_model:
@@ -691,7 +776,14 @@ def cmd_run_train(args: argparse.Namespace) -> int:
         learning_rate=t["lr"],
         mu=t["mu"],
         buffer_size=t["buffer_size"],
+        staleness_weight=m["staleness"],
         seed=t["seed"],
+        partition_strategy=t["partition_strategy"],
+        class_probability=t["class_probability"],
+        preference_mode=t["preference_mode"],
+        preferred_clients_per_class=t["preferred_clients_per_class"],
+        sample_cap_strategy=t["sample_cap_strategy"],
+        data_dir=t["data_dir"],
         **overrides,
     )
 
@@ -714,6 +806,12 @@ def cmd_run_train(args: argparse.Namespace) -> int:
         alpha=t["alpha"],
         classes_per_client=t.get("classes_per_client", None),
         max_samples_per_client=t.get("max_samples", 0),
+        data_dir=t.get("data_dir", "./data"),
+        partition_strategy=t.get("partition_strategy", "probability"),
+        class_probability=t.get("class_probability", 0.8),
+        preference_mode=t.get("preference_mode", "class_balanced"),
+        preferred_clients_per_class=t.get("preferred_clients_per_class", 1),
+        sample_cap_strategy=t.get("sample_cap_strategy", "preserve"),
         verbose=not quiet,
     )
 
@@ -729,8 +827,17 @@ def cmd_run_train(args: argparse.Namespace) -> int:
                 "batch_size": t["batch_size"],
                 "iid": not t["non_iid"],
                 "alpha": t["alpha"],
+                "classes_per_client": t.get("classes_per_client"),
+                "max_samples_per_client": t.get("max_samples"),
+                "partition_strategy": t.get("partition_strategy"),
+                "class_probability": t.get("class_probability"),
+                "preference_mode": t.get("preference_mode"),
+                "preferred_clients_per_class": t.get("preferred_clients_per_class"),
+                "sample_cap_strategy": t.get("sample_cap_strategy"),
+                "data_dir": t.get("data_dir"),
             },
             "history": runner.history_dict,
+            "client_label_distribution": runner.client_label_distribution,
         }
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(output_data, f, ensure_ascii=False, indent=2)
@@ -770,6 +877,7 @@ def cmd_run_experiment(args: argparse.Namespace) -> int:
             return 1
         spec = importlib.util.spec_from_file_location("standard_experiment", spec_path)
         module = importlib.util.module_from_spec(spec)
+        sys.modules["standard_experiment"] = module
         spec.loader.exec_module(module)
         run_experiment_grid = module.run_experiment_grid
 
@@ -805,6 +913,12 @@ def cmd_run_experiment(args: argparse.Namespace) -> int:
             non_iid=t["non_iid"],
             classes_per_client=t.get("classes_per_client", None),
             max_samples_per_client=t.get("max_samples", 0),
+            partition_strategy=t.get("partition_strategy", "probability"),
+            class_probability=t.get("class_probability", 0.8),
+            preference_mode=t.get("preference_mode", "class_balanced"),
+            preferred_clients_per_class=t.get("preferred_clients_per_class", 1),
+            sample_cap_strategy=t.get("sample_cap_strategy", "preserve"),
+            data_dir=t.get("data_dir", "./data"),
         )
         total_elapsed = _time.time() - t_start
         if not getattr(args, "quiet", False):
@@ -821,6 +935,7 @@ def cmd_run_experiment(args: argparse.Namespace) -> int:
             return 1
         spec = importlib.util.spec_from_file_location("spacefl_experiment", spec_path)
         module = importlib.util.module_from_spec(spec)
+        sys.modules["spacefl_experiment"] = module
         spec.loader.exec_module(module)
         run_experiment_suite = module.run_experiment_suite
 
@@ -891,6 +1006,7 @@ def cmd_run_quick_test(args: argparse.Namespace) -> int:
         return 1
     spec = importlib.util.spec_from_file_location("quick_test", spec_path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules["quick_test"] = module
     spec.loader.exec_module(module)
     run_quick_test = module.run_quick_test
 
@@ -1272,7 +1388,8 @@ $fls_commands = @(
     # tune 子命令
     "lr", "rounds", "epochs", "batch", "mu", "buffer-size", "seed",
     "dataset", "scale", "early-stop", "workers", "data-workers",
-    "non-iid", "alpha", "classes-per-client", "max-samples", "device",
+    "non-iid", "alpha", "classes-per-client", "max-samples", "partition-strategy",
+    "class-probability", "data-dir", "device",
     "show", "reset",
     # mount 子命令
     "algo", "isl", "isl-buffer", "isl-step",
@@ -1349,6 +1466,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tune("alpha", "Dirichlet α", cmd_tune_alpha, type=float, help="α值")
     _add_tune("classes-per-client", "每客户端类别数", cmd_tune_classes_per_client, type=int, help="2|3|...")
     _add_tune("max-samples", "每客户端样本上限", cmd_tune_max_samples, type=int, help="样本数, 0=不限")
+    _add_tune("partition-strategy", "??????", cmd_tune_partition_strategy, type=str, help="iid|dirichlet|shard|probability")
+    _add_tune("class-probability", "??????", cmd_tune_class_probability, type=float, help="0.0~1.0")
+    _add_tune("data-dir", "????", cmd_tune_data_dir, type=str, help="?????ImageFolder???")
+    _add_tune("preference-mode", "????", cmd_tune_preference_mode, type=str, help="client_window|class_balanced")
+    _add_tune("preferred-clients-per-class", "????????", cmd_tune_preferred_clients_per_class, type=int, help="??")
+    _add_tune("sample-cap-strategy", "??????", cmd_tune_sample_cap_strategy, type=str, help="preserve|balanced")
     _add_tune("device", "计算设备", cmd_tune_device, type=str, help="cpu|cuda")
 
     p = tune_sub.add_parser("show", help="查看当前调参", add_help=False)
@@ -1433,6 +1556,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_tr.add_argument("--seed", type=int, default=None, help="覆盖种子")
     p_tr.add_argument("--time-model", type=str, default=None, help="覆盖时间模型")
     p_tr.add_argument("--time-model-args", type=str, default=None, help="时间模型参数JSON")
+    p_tr.add_argument("--partition-strategy", choices=["iid", "dirichlet", "shard", "probability"], default=None, help="????????")
+    p_tr.add_argument("--class-probability", type=float, default=None, help="????????")
+    p_tr.add_argument("--data-dir", type=str, default=None, help="??????")
+    p_tr.add_argument("--preference-mode", choices=["client_window", "class_balanced"], default=None, help="??????")
+    p_tr.add_argument("--preferred-clients-per-class", type=int, default=None, help="??????????")
+    p_tr.add_argument("--sample-cap-strategy", choices=["preserve", "balanced"], default=None, help="????????")
     p_tr.add_argument("--output", "-o", type=str, default=None, help="导出JSON")
     p_tr.add_argument("--quiet", "-q", action="store_true", help="安静模式")
     p_tr.add_argument("--no-session", action="store_true", help="忽略session使用默认值")

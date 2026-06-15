@@ -45,6 +45,12 @@ def fedavg_config(**overrides: Any) -> FLConfig:
         "learning_rate": 0.01,
         "classes_per_client": 2,
         "max_samples_per_client": 1000,
+        "partition_strategy": "probability",
+        "class_probability": 0.8,
+        "preference_mode": "class_balanced",
+        "preferred_clients_per_class": 1,
+        "sample_cap_strategy": "preserve",
+        "data_dir": "./data",
     }
     defaults.update(overrides)
     return FLConfig(**defaults)
@@ -76,6 +82,12 @@ def fedprox_config(**overrides: Any) -> FLConfig:
         "mu": 0.01,
         "classes_per_client": 2,
         "max_samples_per_client": 1000,
+        "partition_strategy": "probability",
+        "class_probability": 0.8,
+        "preference_mode": "class_balanced",
+        "preferred_clients_per_class": 1,
+        "sample_cap_strategy": "preserve",
+        "data_dir": "./data",
     }
     defaults.update(overrides)
     return FLConfig(**defaults)
@@ -108,6 +120,12 @@ def fedbuff_config(**overrides: Any) -> FLConfig:
         "staleness_weight": False,
         "classes_per_client": 2,
         "max_samples_per_client": 1000,
+        "partition_strategy": "probability",
+        "class_probability": 0.8,
+        "preference_mode": "class_balanced",
+        "preferred_clients_per_class": 1,
+        "sample_cap_strategy": "preserve",
+        "data_dir": "./data",
     }
     defaults.update(overrides)
     return FLConfig(**defaults)
@@ -154,6 +172,16 @@ DATASET_PRESETS: dict[str, dict[str, Any]] = {
         "model_kwargs": {"num_classes": 10, "in_channels": 3},
         "description": "CIFAR-10 (32×32 彩色, 10类)",
     },
+    "imagefolder": {
+        "model": "simplecnn",
+        "model_kwargs": {"num_classes": 2, "in_channels": 3},
+        "description": "Custom ImageFolder dataset (data_dir/train and data_dir/test)",
+    },
+    "custom": {
+        "model": "simplecnn",
+        "model_kwargs": {"num_classes": 2, "in_channels": 3},
+        "description": "Alias of imagefolder for user-provided datasets",
+    },
 }
 
 
@@ -199,7 +227,6 @@ def get_preset_config(
     """
     algorithm = algorithm.lower()
     scale = scale.lower()
-    dataset = dataset.lower()
 
     if algorithm == "fedavg":
         config = fedavg_config()
@@ -219,10 +246,6 @@ def get_preset_config(
                 setattr(config, k, v)
 
     # 应用数据集预设
-    ds_preset: dict[str, Any] = {}
-    if dataset in DATASET_PRESETS:
-        ds_preset = dict(DATASET_PRESETS[dataset])
-
     # 应用覆盖
     for k, v in overrides.items():
         if hasattr(config, k):

@@ -104,6 +104,13 @@ class FLConfig:
     # 数据划分（模拟太空 FL 小样本 non-IID）
     classes_per_client: int = 2  # 每个客户端限定的类别数（滑动窗口分配），0 表示使用 Dirichlet
     max_samples_per_client: int = 1000  # 每个客户端样本数上限，0 表示不限制
+    partition_strategy: str = "probability"  # iid | dirichlet | shard | probability
+    class_probability: float = 0.8  # probability strategy preference probability
+    preference_mode: str = "class_balanced"  # client_window | class_balanced
+    preferred_clients_per_class: int = 1
+    sample_cap_strategy: str = "preserve"  # preserve | balanced
+    data_dir: str = "./data"
+    limit_to_sim_window: bool = True
 
     @classmethod
     def from_dict(cls, config: dict) -> FLConfig:
@@ -256,6 +263,7 @@ class FLServer:
         self._global_model: Any = None
         self._clients: list[ClientState] = []
         self._history: list[FLRoundResult] = []
+        self._sim_time_limit: int | None = None
 
     def _build_time_model(self) -> TimeModel:
         """根据 FLConfig 构建时间模型实例。"""
@@ -321,6 +329,11 @@ class FLServer:
             # 无调度器：假设始终可通信
             for c in self._clients:
                 c.is_connected = True
+            return
+
+        if self._sim_time_limit is not None and timeslot >= self._sim_time_limit:
+            for c in self._clients:
+                c.is_connected = False
             return
 
         connected = set(self.scheduler.get_connected_sats(timeslot))
@@ -409,7 +422,7 @@ class FLServer:
             # 串行模式：预克隆一次全局权重，所有客户端复用
             global_weights = [param.data.clone() for param in self._global_model.parameters()]
             updates = []
-            for i, cid in enumerate(selected_ids):
+            for cid in selected_ids:
                 print(".", end="", flush=True)
                 update = self._train_client(
                     cid,
@@ -495,6 +508,9 @@ class FLServer:
 
         # 获取模拟器引用（用于通信窗口查询）
         sim = self.scheduler._sim if self.scheduler is not None else None
+        self._sim_time_limit = None
+        if sim is not None and getattr(self.config, "limit_to_sim_window", True):
+            self._sim_time_limit = int(getattr(sim, "num_timeslots_pre", sim.num_timeslots))
 
         # 计算模型大小（字节），供时间模型使用
         model_size_bytes = sum(
@@ -530,7 +546,11 @@ class FLServer:
             breakdown = TimeBreakdown()
 
             # ── 1. 找到下一个有卫星连接的时隙（分发窗口）──
-            start_ts = self._advance_to_next_contact(current_ts)
+            if self._sim_time_limit is not None and current_ts >= self._sim_time_limit:
+                if verbose:
+                    print("  Reached simulation time limit; stopping training.")
+                break
+            start_ts = self._advance_to_next_contact(current_ts, self._sim_time_limit)
             if start_ts is None:
                 if verbose:
                     print(f"  轮次 {completed_rounds + 1}: 无更多通信窗口，训练终止")
@@ -543,6 +563,10 @@ class FLServer:
             download_slots = self.time_model.compute_download_slots(model_size_bytes)
             breakdown.download = download_slots
             current_ts += download_slots
+            if self._sim_time_limit is not None and current_ts >= self._sim_time_limit:
+                if verbose:
+                    print("  Download would exceed simulation time limit; stopping training.")
+                break
 
             # ── 2. 更新通信状态，选择客户端 ──
             self._update_connectivity(current_ts)
@@ -588,9 +612,14 @@ class FLServer:
             # ── 4. 等待各卫星返回（下一次接触窗口 + 上传时间）──
             if sim is not None:
                 return_times = []
+                returned_client_ids: set[int] = set()
                 return_start_ts = current_ts
                 for cid in selected_ids:
-                    next_contact = sim.get_next_contact(cid, current_ts)
+                    next_contact = self._get_next_contact_for_client(
+                        cid,
+                        current_ts,
+                        self._sim_time_limit,
+                    )
                     if next_contact is not None:
                         contact_ts = next_contact[0]
                         # 上传时间叠加在接触窗口之后
@@ -600,7 +629,11 @@ class FLServer:
                         breakdown.per_satellite.setdefault(cid, {})
                         breakdown.per_satellite[cid]["upload"] = upload_slots
                         breakdown.per_satellite[cid]["wait_return"] = contact_ts - current_ts
-                        return_times.append(contact_ts + upload_slots)
+                        arrival_ts = contact_ts + upload_slots
+                        if self._sim_time_limit is not None and arrival_ts >= self._sim_time_limit:
+                            continue
+                        returned_client_ids.add(cid)
+                        return_times.append(arrival_ts)
                 if return_times:
                     current_ts = max(return_times)
                     breakdown.wait_return = current_ts - return_start_ts
@@ -615,6 +648,11 @@ class FLServer:
                 (v.get("upload", 0) for v in breakdown.per_satellite.values()),
                 default=0,
             )
+            if sim is not None:
+                updates = [u for u in updates if u.client_id in returned_client_ids]
+                if not updates:
+                    current_ts += 1
+                    continue
             # 去掉上传时间重复计算（wait_return 已包含 upload 叠加）
             # 这里 wait_return 记录的是从 train_end 到 return_ts 的总等待时间
             # upload 单独记录以便分解展示
@@ -721,35 +759,56 @@ class FLServer:
 
         return self._history
 
-    def _advance_to_next_contact(self, from_ts: int) -> int | None:
-        """
-        从 from_ts 开始找到下一个有任意卫星连接的时隙。
-
-        使用 OrbitSimulator 的按需扩展能力，不再受预计算范围限制。
-        如果没有调度器，直接返回 from_ts（假设始终可通信）。
-
-        Returns
-        -------
-        int | None
-            下一个可通信时隙，或 None（所有卫星永久无连接）。
-        """
+    def _advance_to_next_contact(
+        self,
+        from_ts: int,
+        max_timeslot: int | None = None,
+    ) -> int | None:
+        """Find the next connected timeslot without extending the simulator window."""
         if self.scheduler is None:
+            if max_timeslot is not None and from_ts >= max_timeslot:
+                return None
             return from_ts
 
         sim = self.scheduler._sim
+        if max_timeslot is None:
+            earliest = None
+            for sat_id in range(sim.num_satellites):
+                nc = sim.get_next_contact(sat_id, from_ts - 1)
+                if nc is not None:
+                    ts, _ = nc
+                    if earliest is None or ts < earliest:
+                        earliest = ts
+            return earliest
 
-        # 用 get_next_contact 为每颗卫星高效查找（支持按需扩展）
-        earliest = None
-        for sat_id in range(sim.num_satellites):
-            nc = sim.get_next_contact(sat_id, from_ts - 1)
-            if nc is not None:
-                ts, _ = nc
-                if earliest is None or ts < earliest:
-                    earliest = ts
+        start_ts = max(from_ts, 0)
+        stop_ts = min(max_timeslot, getattr(sim, "num_timeslots", max_timeslot))
+        for ts in range(start_ts, stop_ts):
+            if self.scheduler.get_connected_sats(ts):
+                return ts
+        return None
 
-        return earliest
+    def _get_next_contact_for_client(
+        self,
+        sat_id: int,
+        after_ts: int,
+        max_timeslot: int | None = None,
+    ) -> tuple[int, int] | None:
+        """Find one client's next contact without crossing the simulation cap."""
+        if self.scheduler is None:
+            return None
 
-    # ── 异步训练模式 (FedBuff) ──────────────────────────────
+        sim = self.scheduler._sim
+        if max_timeslot is None:
+            return sim.get_next_contact(sat_id, after_ts)
+
+        start_ts = max(after_ts + 1, 0)
+        stop_ts = min(max_timeslot, getattr(sim, "num_timeslots", max_timeslot))
+        for ts in range(start_ts, stop_ts):
+            gs_id = sim.contact_matrix.get_first_contact(sat_id, ts)
+            if gs_id >= 0:
+                return (ts, int(gs_id))
+        return None
 
     def run_async(
         self,
@@ -798,7 +857,14 @@ class FLServer:
             )
 
         buffer_agg: BufferAggregator = self.aggregator
+        sim = self.scheduler._sim if self.scheduler is not None else None
+        self._sim_time_limit = None
+        if sim is not None and getattr(self.config, "limit_to_sim_window", True):
+            self._sim_time_limit = int(getattr(sim, "num_timeslots_pre", sim.num_timeslots))
+
         total_timeslots = self.config.num_rounds * self.config.timeslots_per_round
+        if self._sim_time_limit is not None:
+            total_timeslots = min(total_timeslots, self._sim_time_limit)
         training_clients: set[int] = set()
         global_round = 0
 
@@ -848,7 +914,7 @@ class FLServer:
                 status = buffer_agg.buffer_status()
                 result = FLRoundResult(
                     round_num=global_round,
-                    num_clients=status["current_count"],
+                    num_clients=status.get("last_aggregate_count", status["current_count"]),
                     train_loss=0.0,  # 异步模式下难以精确计算
                     eval_metrics=dict(last_eval_metrics),
                     timeslot=ts,
@@ -869,6 +935,13 @@ class FLServer:
             test_loader,
             global_round,
         )
+        self._history.append(FLRoundResult(
+            round_num=global_round,
+            num_clients=0,
+            train_loss=0.0,
+            eval_metrics=dict(final_metrics),
+            timeslot=total_timeslots,
+        ))
         if verbose:
             acc = final_metrics.get("accuracy", 0)
             print(f"\n  最终准确率: {acc:.4f}")
